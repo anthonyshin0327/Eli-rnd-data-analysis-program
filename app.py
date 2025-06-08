@@ -3,29 +3,28 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.figure_factory as ff
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import accuracy_score, r2_score
-from lazypredict.Supervised import LazyRegressor, LazyClassifier
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor, plot_tree
+from sklearn.metrics import r2_score
 from scipy.optimize import curve_fit
 from io import BytesIO
 import base64
-import re
 import warnings
+import itertools
+import matplotlib.pyplot as plt
+import shap
 
-# --- Model Imports for Deep Dive ---
-from sklearn.ensemble import AdaBoostRegressor, BaggingRegressor, ExtraTreesRegressor, GradientBoostingRegressor, RandomForestRegressor
+# --- Model Imports ---
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.linear_model import BayesianRidge, ElasticNet, Lasso, Ridge, SGDRegressor
-from sklearn.neighbors import KNeighborsRegressor
-from xgboost import XGBRegressor
-from lightgbm import LGBMRegressor
-
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+from skopt import gp_minimize
+from skopt.space import Real
+from skopt.utils import use_named_args
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -44,31 +43,28 @@ def five_pl(x, a, b, c, d, g):
     """5-Parameter Logistic Regression model function."""
     x = np.asarray(x, dtype=float)
     with np.errstate(divide='ignore', invalid='ignore'):
-        val = d + (a - d) / (1 + np.exp(b * (np.log(x) - np.log(c))))**g
+        x_safe = np.where(x <= 0, 1e-9, x)
+        val = d + (a - d) / (1 + np.exp(b * (np.log(x_safe) - np.log(c))))**g
     return val
 
 def four_pl(x, a, b, c, d):
     """4-Parameter Logistic Regression model function."""
     x = np.asarray(x, dtype=float)
     with np.errstate(divide='ignore', invalid='ignore'):
-        val = d + (a - d) / (1 + np.exp(b * (np.log(x) - np.log(c))))
+        x_safe = np.where(x <= 0, 1e-9, x)
+        val = d + (a - d) / (1 + np.exp(b * (np.log(x_safe) - np.log(c))))
     return val
-
-
-def get_table_download_link(df, filename, text):
-    """Generates a link allowing the data in a given panda dataframe to be downloaded."""
-    csv = df.to_csv(index=False)
-    b64 = base64.b64encode(csv.encode()).decode()
-    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">{text}</a>'
-    return href
 
 def get_excel_download_link(dfs_dict, filename):
     """Generates a link to download a multi-sheet Excel file."""
     output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
         for sheet_name, df in dfs_dict.items():
             if df is not None:
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                try:
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                except Exception as e:
+                    st.warning(f"Could not write sheet '{sheet_name}': {e}")
     excel_data = output.getvalue()
     b64 = base64.b64encode(excel_data).decode()
     href = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}">Download Full Report (XLSX)</a>'
@@ -81,398 +77,406 @@ def main():
     with st.sidebar:
         st.title("🔬 LFA Analysis & ML Suite")
         st.markdown("---")
-        st.header("Workflow Control")
-
-        # Initialize session state
-        for key in ['data_source', 'df_raw', 'df_tidy', 'df_5pl_results', 'df_doe_factors', 'df_tidy_doe', 'df_5pl_results_doe', 'automl_models']:
+        
+        st.header("1. Data Upload")
+        keys_to_init = [
+            'data_source', 'df_raw', 'df_tidy', 'df_5pl_results',
+            'df_doe_factors', 'df_tidy_doe', 'df_5pl_results_doe',
+            'gpr_model', 'rsm_model', 'rf_model', 'doe_features', 'doe_model_r2',
+            'y_scaler', 'x_preprocessor', 'target_col', 'performance_metrics',
+            'X_train', 'y_train', 'final_doe_df', 'df_tidy_merged', 'df_5pl_results_merged'
+        ]
+        for key in keys_to_init:
             if key not in st.session_state:
                 st.session_state[key] = None
 
-        st.session_state.data_source = st.radio(
-            "1. Choose your data source", ('LUMOS', 'Custom'),
+        st.radio(
+            "Choose data source", ('LUMOS', 'Custom'),
+            key='data_source',
             help="Select 'LUMOS' for standard files or 'Custom' for other formats."
         )
-        uploaded_file = st.file_uploader("2. Upload your data file", type=["csv"])
+        uploaded_file = st.file_uploader("Upload data file", type=["csv", "xlsx"])
 
         if uploaded_file:
             try:
-                st.session_state.df_raw = pd.read_csv(uploaded_file)
+                for key in keys_to_init:
+                    if key == 'data_source':
+                        continue
+                    st.session_state[key] = None
+                
+                if uploaded_file.name.endswith('.csv'):
+                    st.session_state.df_raw = pd.read_csv(uploaded_file)
+                else:
+                    st.session_state.df_raw = pd.read_excel(uploaded_file)
+                st.sidebar.success("File uploaded successfully!")
+
+                if st.session_state.data_source == 'Custom':
+                    st.session_state.df_tidy = st.session_state.df_raw.copy()
             except Exception as e:
                 st.error(f"Error reading file: {e}")
                 st.session_state.df_raw = None
         
         st.markdown("---")
-        st.info("This app provides a streamlined workflow for analyzing Lateral Flow Assay (LFA) data, from initial data processing to advanced machine learning.")
+        st.header("2. Navigation")
+        st.markdown("""
+        * [Data Preprocessing](#step-1-data-preprocessing)
+        * [Dose-Response Analysis](#step-2-dose-response-analysis)
+        * [DoE Modeling & Visualization](#step-3-doe-modeling-visualization)
+        * [Bayesian Optimization](#step-4-bayesian-optimization)
+        * [Download Report](#step-5-generate-and-download-report)
+        """)
 
     st.title("LFA Data Analysis and Machine Learning Pipeline")
-    st.markdown("Follow the steps below to analyze your data. Options will appear as you complete each stage.")
 
     if st.session_state.df_raw is not None:
-        st.success("File uploaded successfully!")
-        with st.expander("Show Uploaded Data Preview"):
-            st.dataframe(st.session_state.df_raw.head())
-
-        st.header("Step 1: Data Preprocessing")
-        if st.session_state.data_source == 'LUMOS':
-            handle_lumos_processing()
-        else:
-            st.info("Custom data loaded. Proceed to Exploratory Data Analysis.")
-            st.session_state.df_tidy = st.session_state.df_raw.copy()
-            st.dataframe(st.session_state.df_tidy.head())
-
-        if st.session_state.df_tidy is not None:
-            if st.session_state.data_source == 'LUMOS':
-                with st.expander("Step 2: Dose-Response Analysis (Optional)"):
-                    handle_dose_response_regression()
-            with st.expander("Step 3: Exploratory Data Analysis (EDA)", expanded=True):
-                handle_eda()
-            with st.expander("Step 4: Automated Machine Learning & Optimization", expanded=True):
-                handle_ml()
-            with st.expander("Step 5: AI-Generated Conclusion"):
-                 st.warning("AI-Generated Conclusion feature is under development.")
-            with st.expander("Step 6: Generate and Download Report"):
-                handle_reporting()
+        handle_lumos_processing()
+        handle_dose_response_regression()
+        handle_doe_modeling()
+        handle_bayesian_optimization()
+        handle_reporting()
     else:
-        st.info("Awaiting data file upload...")
+        st.info("Awaiting data file upload in the sidebar...")
 
 def handle_lumos_processing():
-    """Manages the processing pipeline for LUMOS data."""
-    st.subheader("LUMOS Data Processing")
-    df_raw = st.session_state.df_raw
-    required_cols = ['strip name', 'line_peak_above_background_1', 'line_peak_above_background_2']
-    if not all(col in df_raw.columns for col in required_cols):
-        st.error(f"LUMOS file must contain the following columns: {', '.join(required_cols)}")
-        return
-
-    first_strip_name = df_raw['strip name'].iloc[0]
-    delimiter = '-' if '-' in first_strip_name else '_' if '_' in first_strip_name else None
-    if not delimiter:
-        st.error("Could not auto-detect delimiter ('-' or '_') in 'strip name' column.")
-        return
-
-    st.success(f"Detected delimiter: '{delimiter}'")
-    num_groups = len(first_strip_name.split(delimiter))
-    st.markdown(f"Detected **{num_groups}** groups in 'strip name'. Please name them:")
-    group_names = [st.text_input(f"Group {i+1} Name", f"Factor_{i+1}") for i in range(num_groups)]
-
-    if st.button("Process LUMOS Data"):
-        df = df_raw.copy()
-        try:
-            split_cols = df['strip name'].str.split(delimiter, expand=True)
-            if split_cols.shape[1] == len(group_names):
-                split_cols.columns = group_names
-                df = pd.concat([split_cols, df], axis=1)
-                for col in group_names:
-                    df[col] = pd.to_numeric(df[col], errors='ignore')
-            else:
-                st.error("Mismatch between detected groups and provided names.")
-                return
-        except Exception as e:
-            st.error(f"Error splitting columns: {e}")
+    with st.container(border=True):
+        st.header("Step 1: Data Preprocessing", anchor="step-1-data-preprocessing")
+        
+        if st.session_state.df_raw is None:
             return
 
-        df = df.rename(columns={'line_peak_above_background_1': 'T', 'line_peak_above_background_2': 'C'})
-        df['T+C'] = df['T'] + df['C']
-        df['T_norm'] = df['T'].divide(df['T+C']).fillna(0)
-        df['C_norm'] = df['C'].divide(df['T+C']).fillna(0)
-        df['T-C'] = df['T'] - df['C']
-        df['C/T'] = df['C'].divide(df['T']).fillna(0).replace([np.inf, -np.inf], 0)
-        final_cols = group_names + ['T', 'C', 'T_norm', 'C_norm', 'T-C', 'C/T']
-        st.session_state.df_tidy = df[final_cols]
-        st.subheader("Processed Tidy Data")
-        st.dataframe(st.session_state.df_tidy)
-        st.success("LUMOS data processed successfully!")
-
-def handle_dose_response_regression():
-    """Manages the 4PL/5PL regression analysis section."""
-    if st.session_state.df_tidy is None:
-        st.info("Process LUMOS data first to enable this section.")
-        return
-
-    df = st.session_state.df_tidy.copy()
-    if not st.checkbox("Perform Dose-Response Regression?"):
-        return
-
-    model_choice = st.radio("Select Regression Model", ("5PL", "4PL"), help="5PL includes an asymmetry parameter 'g'; 4PL is symmetrical (g=1).")
-    
-    y_vars = ['T', 'C', 'T_norm', 'C_norm', 'T-C', 'C/T']
-    group_cols = [col for col in df.columns if col not in y_vars]
-    conc_col = st.selectbox("Select the analyte concentration column:", group_cols)
-    group_by_col = st.selectbox("Select a column to group the analysis by:", group_cols) # Made mandatory for DoE
-    y_var_to_plot = st.selectbox("Select the response variable (Y-axis) to analyze:", y_vars)
-    
-    df[conc_col] = pd.to_numeric(df[conc_col], errors='coerce')
-    df.dropna(subset=[conc_col, y_var_to_plot], inplace=True)
-    if df.empty:
-        st.warning(f"No valid data in '{conc_col}' or '{y_var_to_plot}' columns.")
-        return
-
-    st.markdown(f"### {model_choice} Regression Results")
-    results = []
-    groups_to_iterate = df[group_by_col].unique()
-    overfitting_warning = False
-
-    for group in groups_to_iterate:
-        group_df = df[df[group_by_col] == group]
-        X_orig, y = group_df[conc_col], group_df[y_var_to_plot]
-        if len(X_orig) < 5: continue
-
-        X_fit = X_orig.copy().replace(0, 1e-9)
-        try:
-            non_zero_X = X_orig[X_orig > 0]
-            median_X = np.median(non_zero_X) if not non_zero_X.empty else 1.0
-            
-            if model_choice == "5PL":
-                p0 = [np.min(y), 1, median_X, np.max(y), 1]
-                params, _ = curve_fit(five_pl, X_fit, y, p0=p0, maxfev=10000, bounds=(-np.inf, np.inf))
-                if 0.95 < params[4] < 1.05: # Check if g is close to 1
-                    overfitting_warning = True
-            else: # 4PL
-                p0 = [np.min(y), 1, median_X, np.max(y)]
-                params, _ = curve_fit(four_pl, X_fit, y, p0=p0, maxfev=10000, bounds=(-np.inf, np.inf))
-
-            target_func = five_pl if model_choice == "5PL" else four_pl
-            y_pred = target_func(X_fit, *params)
-            r2 = r2_score(y, y_pred)
-            results.append([group] + list(params) + [r2])
-
-        except (RuntimeError, ValueError) as e:
-            st.warning(f"Could not fit {model_choice} model for group '{group}': {e}")
-    
-    if overfitting_warning:
-        st.info("💡 Suggestion: The asymmetry parameter 'g' in one or more of your 5PL fits is close to 1. A 4PL model might provide a simpler and equally effective fit.")
-
-    if not results:
-        st.warning("No models were successfully fitted.")
-        return
-
-    # Define columns based on model choice
-    if model_choice == "5PL":
-        res_cols = ['Group', 'a (Min Y)', 'b (Steepness)', 'c (IC50)', 'd (Max Y)', 'g (Asymmetry)', 'R-squared']
-    else:
-        res_cols = ['Group', 'a (Min Y)', 'b (Steepness)', 'c (IC50)', 'd (Max Y)', 'R-squared']
-
-    results_df = pd.DataFrame(results, columns=res_cols)
-    st.session_state.df_5pl_results = results_df.copy()
-    st.subheader("Fitted Model Parameters")
-    st.dataframe(results_df)
-
-    use_log_scale = st.checkbox("Use Logarithmic Scale for X-axis", True)
-    fig = go.Figure()
-    for group_name in groups_to_iterate:
-        group_df = df[df[group_by_col] == group_name]
-        X_plot, y_plot = group_df[conc_col], group_df[y_var_to_plot]
-        fig.add_trace(go.Scatter(x=X_plot, y=y_plot, mode='markers', name=f'Raw - {group_name}'))
+        st.subheader("Uploaded Data Preview")
+        st.dataframe(st.session_state.df_raw.head())
         
-        if group_name in results_df['Group'].values:
-            fit_params = results_df[results_df['Group'] == group_name].iloc[0, 1:-1].values
-            X_fit_plot = X_plot.copy().replace(0, 1e-9)
-            if not X_fit_plot.empty:
-                x_min_log, x_max_log = np.log10(X_fit_plot.min()), np.log10(X_fit_plot.max())
-                x_range = np.logspace(x_min_log, x_max_log, 100)
-                
-                plot_func = five_pl if model_choice == '5PL' else four_pl
-                y_fit = plot_func(x_range, *fit_params)
-                fig.add_trace(go.Scatter(x=x_range, y=y_fit, mode='lines', name=f'Fit - {group_name}'))
-    
-    fig.update_layout(title=f"{model_choice} Fit for {y_var_to_plot} vs {conc_col}", xaxis_title=conc_col, yaxis_title=y_var_to_plot, xaxis_type="log" if use_log_scale else "linear")
-    st.plotly_chart(fig, use_container_width=True)
+        if st.session_state.data_source == 'LUMOS':
+            st.subheader("LUMOS Data Processing")
+            df_raw = st.session_state.df_raw
+            required_cols = ['strip name', 'line_peak_above_background_1', 'line_peak_above_background_2']
+            if not all(col in df_raw.columns for col in required_cols):
+                st.error(f"LUMOS file must contain: {', '.join(required_cols)}")
+                return
 
-    # --- DoE Factor Definition ---
-    st.subheader("Define DoE Factors for Analysis")
-    st.info("Define the experimental factors corresponding to each group. This creates an enriched dataset for ML.")
-    
-    num_doe_factors = st.number_input("How many DoE factors to define?", min_value=1, value=2, step=1)
-    doe_factor_names = [st.text_input(f"Name for DoE Factor {i+1}", f"DoE_Factor_{i+1}") for i in range(num_doe_factors)]
-    
-    if 'df_5pl_results' in st.session_state and st.session_state.df_5pl_results is not None:
-        doe_df_template = pd.DataFrame(columns=doe_factor_names, index=st.session_state.df_5pl_results['Group'].unique())
-        st.write("Enter the values for each factor for each group:")
-        edited_doe_df = st.data_editor(doe_df_template)
-        
-        if st.button("Merge DoE Factors into Datasets"):
-            st.session_state.df_doe_factors = edited_doe_df.copy()
-            st.session_state.df_doe_factors['Group'] = st.session_state.df_doe_factors.index
+            if df_raw['strip name'].empty:
+                st.error("'strip name' column is empty.")
+                return
+
+            first_strip_name = str(df_raw['strip name'].iloc[0])
+            delimiter = '-' if '-' in first_strip_name else '_' if '_' in first_strip_name else None
             
-            st.session_state.df_5pl_results_doe = pd.merge(st.session_state.df_5pl_results, st.session_state.df_doe_factors, on='Group', how='left')
-            st.subheader("Dose-Response Results with DoE Factors")
-            st.dataframe(st.session_state.df_5pl_results_doe)
-
-            st.session_state.df_tidy_doe = pd.merge(st.session_state.df_tidy, st.session_state.df_doe_factors, left_on=group_by_col, right_on='Group', how='left')
-            st.subheader("Tidy Data with DoE Factors")
-            st.dataframe(st.session_state.df_tidy_doe.head())
-
-            st.success("DoE factors successfully merged!")
-
-
-def handle_eda():
-    """Manages the exploratory data analysis section."""
-    st.subheader("Descriptive Statistics")
-    st.dataframe(st.session_state.df_tidy.describe(include='all'))
-    st.subheader("Visualizations")
-    all_cols = st.session_state.df_tidy.columns.tolist()
-    numerical_cols = st.session_state.df_tidy.select_dtypes(include=np.number).columns.tolist()
-    categorical_cols = st.session_state.df_tidy.select_dtypes(include=['object', 'category']).columns.tolist()
-    if not numerical_cols:
-        st.warning("No numerical data to visualize.")
-        return
-    
-    plot_options = ["Histogram", "Box Plot", "Heatmap", "3D Scatter Plot", "Violin Plot", "Scatter Matrix", "Density Contour", "Sunburst Chart"]
-    plot_type = st.selectbox("Choose a plot type:", plot_options)
-
-    if plot_type == "Histogram":
-        col_to_plot = st.selectbox("Select numerical column:", numerical_cols)
-        color_col = st.selectbox("Color by (optional):", [None] + categorical_cols, key='hist_color')
-        st.plotly_chart(px.histogram(st.session_state.df_tidy, x=col_to_plot, color=color_col, title=f"Histogram of {col_to_plot}"), use_container_width=True)
-    elif plot_type == "Box Plot":
-        y_col, x_col = st.selectbox("Y-axis (numerical):", numerical_cols, key='box_y'), st.selectbox("X-axis:", all_cols, key='box_x')
-        color_col = st.selectbox("Color by (optional):", [None] + categorical_cols, key='box_color')
-        st.plotly_chart(px.box(st.session_state.df_tidy, x=x_col, y=y_col, color=color_col, title=f"Box Plot of {y_col} by {x_col}"), use_container_width=True)
-    elif plot_type == "Heatmap":
-        st.plotly_chart(px.imshow(st.session_state.df_tidy[numerical_cols].corr(), text_auto=True, title="Correlation Heatmap"), use_container_width=True)
-    # ... other plots follow a similar pattern ...
-
-def handle_ml():
-    """Manages the machine learning modeling section."""
-    st.subheader("Automated Model Benchmarking")
-    st.info("This module uses LazyPredict to quickly compare dozens of models.")
-    
-    # --- Data Selection for ML ---
-    ml_options = ["Measurement Data (Tidy)"]
-    if hasattr(st.session_state, 'df_tidy_doe') and st.session_state.df_tidy_doe is not None: ml_options.append("Measurement Data with DoE Factors")
-    if st.session_state.df_5pl_results is not None: ml_options.append("Dose-Response Results (Grouped)")
-    if hasattr(st.session_state, 'df_5pl_results_doe') and st.session_state.df_5pl_results_doe is not None: ml_options.append("Dose-Response Results with DoE Factors")
-    
-    ml_choice = st.radio("Choose data for ML analysis:", ml_options)
-
-    analysis_df = None
-    if ml_choice == "Measurement Data (Tidy)": analysis_df = st.session_state.df_tidy
-    elif ml_choice == "Measurement Data with DoE Factors": analysis_df = st.session_state.df_tidy_doe
-    elif ml_choice == "Dose-Response Results (Grouped)": analysis_df = st.session_state.df_5pl_results
-    else: analysis_df = st.session_state.df_5pl_results_doe
-    
-    if analysis_df is None:
-        st.warning("Selected dataset is not available yet. Please complete the required steps.")
-        return
-
-    st.dataframe(analysis_df.head())
-    all_cols = analysis_df.columns.tolist()
-    target_col = st.selectbox("Select the target (output) variable (Y):", all_cols)
-    
-    if not target_col: return
-        
-    feature_cols = st.multiselect("Select the feature (input) variables (X):", [c for c in all_cols if c != target_col], default=[c for c in all_cols if c != target_col and analysis_df[c].dtype != 'object'])
-
-    if not feature_cols:
-        st.warning("Please select at least one feature variable.")
-        return
-
-    X = analysis_df[feature_cols]
-    y = analysis_df[target_col]
-    
-    is_classification = pd.api.types.is_string_dtype(y) or pd.api.types.is_categorical_dtype(y) or (pd.api.types.is_integer_dtype(y) and y.nunique() < 25)
-    st.write(f"**Analysis Mode:** {'Classification' if is_classification else 'Regression'}")
-    
-    # Define preprocessor outside the button so it's available for the deep dive
-    numerical_features = X.select_dtypes(include=np.number).columns.tolist()
-    categorical_features = X.select_dtypes(include=['object', 'category']).columns.tolist()
-    preprocessor = ColumnTransformer(transformers=[('num', StandardScaler(), numerical_features), ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), categorical_features)])
-
-    if st.button("Run AutoML Analysis"):
-        with st.spinner("Training and evaluating models..."):
-            test_size_adj = 0.2
-            if len(X) < 10:
-                st.warning("Warning: The dataset is very small. Test set size adjusted.")
-                test_size_adj = 2 if len(X) > 2 else 1
-            
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size_adj, random_state=42)
-            
-            if is_classification:
-                clf = LazyClassifier(verbose=0, ignore_warnings=True, preprocessor=preprocessor)
-                models, _ = clf.fit(X_train, X_test, y_train, y_test)
-                st.subheader("LazyPredict Classification Results")
+            if not delimiter:
+                st.warning("Could not auto-detect delimiter ('-' or '_') in 'strip name'. Treating 'strip name' as a single factor.")
+                num_groups = 1
+                group_names = [st.text_input("Group 1 Name", "Factor_1", key="group_name_0")]
             else:
-                X_train_processed, X_test_processed = preprocessor.fit_transform(X_train), preprocessor.transform(X_test)
-                reg = LazyRegressor(verbose=0, ignore_warnings=True)
-                models, _ = reg.fit(X_train_processed, X_test_processed, y_train, y_test)
-                st.subheader("LazyPredict Regression Results")
+                num_groups = len(first_strip_name.split(delimiter))
+                st.markdown(f"Detected **{num_groups}** groups in 'strip name' based on delimiter '{delimiter}'. Please name them:")
+                group_names = [st.text_input(f"Group {i+1}", f"Factor_{i+1}", key=f"group_name_{i}") for i in range(num_groups)]
 
-            st.session_state.automl_models = models
-            st.dataframe(models)
-            st.success("AutoML analysis complete!")
-            st.balloons()
-    
-    # --- Model Deep Dive & Optimization ---
-    if st.session_state.automl_models is not None:
-        st.markdown("---")
-        st.subheader("Model Deep Dive & Optimization")
+            with st.spinner("Processing..."):
+                df = df_raw.copy()
+                if delimiter:
+                    split_cols = df['strip name'].astype(str).str.split(delimiter, expand=True)
+                    if split_cols.shape[1] != len(group_names):
+                        st.error(f"Mismatch in group count. Expected {len(group_names)} but found {split_cols.shape[1]} for some rows. Please check 'strip name' consistency.")
+                        return
+                    split_cols.columns = group_names
+                    df = pd.concat([split_cols, df], axis=1)
+                else:
+                    df.rename(columns={'strip name': group_names[0]}, inplace=True)
+
+                for col in group_names:
+                    df[col] = pd.to_numeric(df[col], errors='ignore')
+                
+                df = df.rename(columns={'line_peak_above_background_1': 'T', 'line_peak_above_background_2': 'C'})
+                df['T+C'] = df['T'] + df['C']
+                df['T_norm'] = df['T'].divide(df['T+C']).fillna(0)
+                df['C_norm'] = df['C'].divide(df['T+C']).fillna(0)
+                df['T-C'] = df['T'] - df['C']
+                df['C/T'] = df['C'].divide(df['T']).replace([np.inf, -np.inf], 0).fillna(0)
+                df['T/C'] = df['T'].divide(df['C']).replace([np.inf, -np.inf], 0).fillna(0)
+
+                relevant_cols = group_names + ['T', 'C', 'T_norm', 'C_norm', 'T-C', 'T+C', 'C/T', 'T/C']
+                final_cols = [col for col in relevant_cols if col in df.columns]
+                st.session_state.df_tidy = df[final_cols]
         
-        MODEL_MAP = {
-            "AdaBoostRegressor": AdaBoostRegressor, "BaggingRegressor": BaggingRegressor, "DecisionTreeRegressor": DecisionTreeRegressor,
-            "ExtraTreesRegressor": ExtraTreesRegressor, "GaussianProcessRegressor": GaussianProcessRegressor, 
-            "GradientBoostingRegressor": GradientBoostingRegressor, "KNeighborsRegressor": KNeighborsRegressor, 
-            "LGBMRegressor": LGBMRegressor, "RandomForestRegressor": RandomForestRegressor, "XGBRegressor": XGBRegressor,
-            "BayesianRidge": BayesianRidge, "ElasticNet": ElasticNet, "Lasso": Lasso, "Ridge": Ridge, "SGDRegressor": SGDRegressor,
-        }
+        if st.session_state.get('df_tidy') is not None:
+            st.subheader("Checkpoint: Processed Tidy Data")
+            st.markdown("This is the resulting table from Step 1. It will be used as the input for all subsequent steps.")
+            st.dataframe(st.session_state.df_tidy)
         
-        model_name = st.selectbox("Select a model for deep dive:", st.session_state.automl_models.index)
-        model_class = MODEL_MAP.get(model_name)
+def handle_dose_response_regression():
+    with st.container(border=True):
+        st.header("Step 2: Dose-Response Analysis", anchor="step-2-dose-response-analysis")
+        if st.session_state.get('df_tidy') is None:
+            st.info("Complete Step 1 to generate the Tidy Data required for this step.")
+            return
 
-        if model_class:
-            st.markdown("#### Predict Optimal Conditions")
-            optimization_goal = st.radio("Optimization Goal", ("Minimize", "Maximize"), horizontal=True)
+        perform_dr = st.toggle("Perform Dose-Response Regression?", value=True, key="perform_dr")
+        
+        if not perform_dr:
+            st.session_state.df_5pl_results_doe = st.session_state.df_tidy.copy()
+            st.info("Skipping dose-response. The Tidy Data from Step 1 will be passed directly to the modeling step.")
+            st.session_state.df_5pl_results = None
+            return
+        
+        model_choice = st.radio("Select Model", ("5PL", "4PL"), key="dr_model_choice", horizontal=True)
+        
+        y_vars = ['T', 'C', 'T_norm', 'C_norm', 'T-C', 'C/T', 'T/C', 'T+C']
+        all_cols = st.session_state.df_tidy.columns
+        group_cols = [c for c in all_cols if c not in y_vars and pd.api.types.is_numeric_dtype(st.session_state.df_tidy[c])]
+        
+        if not group_cols:
+            st.error("No suitable numeric grouping or concentration columns found in the Tidy Data.")
+            return
 
-            search_space = {}
-            for col in numerical_features:
-                min_val, max_val = float(X[col].min()), float(X[col].max())
-                search_space[col] = st.slider(f"Range for {col}", min_val, max_val, (min_val, max_val))
-            
-            for col in categorical_features:
-                search_space[col] = st.multiselect(f"Values for {col}", options=X[col].unique(), default=X[col].unique())
-            
-            if st.button("Find Optimum"):
-                with st.spinner("Searching for optimal combination..."):
-                    full_pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('regressor', model_class())])
-                    full_pipeline.fit(X, y)
+        col1, col2, col3 = st.columns(3)
+        conc_col = col1.selectbox("Concentration column:", group_cols, key="dr_conc_col")
+        group_by_col = col2.selectbox("Group analysis by:", group_cols, key="dr_group_col", help="A model will be fit for each unique value in this column.")
+        y_var = col3.selectbox("Response variable (Y-axis):", y_vars, key="dr_y_var", index=2)
+        
+        with st.spinner("Fitting models..."):
+            df = st.session_state.df_tidy.copy()
+            df[conc_col] = pd.to_numeric(df[conc_col], errors='coerce')
+            df[y_var] = pd.to_numeric(df[y_var], errors='coerce')
+            df.dropna(subset=[conc_col, y_var], inplace=True)
 
-                    grid_values = [np.linspace(search_space[c][0], search_space[c][1], 10) if c in numerical_features else search_space[c] for c in X.columns]
+            results = []
+            bounds_4pl = ([-np.inf, 0.5, -np.inf, -np.inf], [np.inf, 2.0, np.inf, np.inf])
+            bounds_5pl = ([-np.inf, 0.5, -np.inf, -np.inf, 0.7], [np.inf, 2.0, np.inf, np.inf, 1.3])
+
+            for group in sorted(df[group_by_col].unique()):
+                group_df = df[df[group_by_col] == group]
+                X_fit, y_fit = group_df[conc_col], group_df[y_var]
+                if len(X_fit) < 4: continue
+                try:
+                    p0_median_X = np.median(X_fit[X_fit > 0]) if (X_fit > 0).any() else 1
+                    if model_choice == "5PL":
+                        p0 = [y_fit.min(), 1, p0_median_X, y_fit.max(), 1]
+                        params, _ = curve_fit(five_pl, X_fit, y_fit, p0=p0, maxfev=10000, bounds=bounds_5pl)
+                        r2 = r2_score(y_fit, five_pl(X_fit, *params))
+                    else:
+                        p0 = [y_fit.min(), 1, p0_median_X, y_fit.max()]
+                        params, _ = curve_fit(four_pl, X_fit, y_fit, p0=p0, maxfev=10000, bounds=bounds_4pl)
+                        r2 = r2_score(y_fit, four_pl(X_fit, *params))
                     
-                    grid = pd.DataFrame(np.array(np.meshgrid(*grid_values)).T.reshape(-1, len(X.columns)), columns=X.columns)
-                    
-                    predictions = full_pipeline.predict(grid)
-                    grid['predicted_target'] = predictions
+                    results.append([group] + list(params) + [r2])
+                except (RuntimeError, ValueError) as e:
+                    st.warning(f"Could not fit model for group '{group}': {e}")
 
-                    optimum_idx = grid['predicted_target'].idxmax() if optimization_goal == "Maximize" else grid['predicted_target'].idxmin()
-                    optimum_combination = grid.loc[optimum_idx]
+            if results:
+                param_names = ['a', 'b', 'c', 'd', 'g'] if model_choice == "5PL" else ['a', 'b', 'c', 'd']
+                results_df = pd.DataFrame(results, columns=['Group'] + param_names + ['R-squared'])
+                st.session_state.df_5pl_results = results_df
+                st.session_state.df_5pl_results_doe = results_df.copy()
+            else:
+                st.warning("Could not derive any dose-response models.")
+                st.session_state.df_5pl_results = None
+                st.session_state.df_5pl_results_doe = None
 
-                    st.metric(label=f"Optimal Predicted {target_col}", value=f"{optimum_combination['predicted_target']:.4f}")
-                    st.write("Using combination:")
-                    st.json(optimum_combination.drop('predicted_target').to_dict())
+        if st.session_state.get('df_5pl_results') is not None:
+            results_df = st.session_state.df_5pl_results
+            st.subheader("Checkpoint: Dose-Response Results")
+            st.markdown("This table of model parameters will be used for DoE Modeling in Step 3.")
+            st.dataframe(results_df)
 
-                    fig = px.parallel_coordinates(grid, color="predicted_target", 
-                                                  color_continuous_scale=px.colors.sequential.Viridis,
-                                                  title="Optimization Search Results")
-                    st.plotly_chart(fig)
-        else:
-            st.warning("Selected model is not yet available for a deep dive.")
+            if 'c' in results_df.columns and not results_df.empty:
+                best_performer = results_df.loc[results_df['c'].idxmin()]
+                st.markdown("""
+                <style>
+                div[data-testid="stMetric"] {
+                    background-color: #e8f5e9;
+                    border: 1px solid #4CAF50;
+                    padding: 1rem;
+                    border-radius: 0.5rem;
+                }
+                </style>""", unsafe_allow_html=True)
+                st.subheader("🏆 Best Performer (Lowest IC50)")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Group", f"{best_performer['Group']}")
+                col2.metric("IC50 (Value of 'c')", f"{best_performer['c']:.3f}")
+                col3.metric("R²", f"{best_performer['R-squared']:.4f}")
 
+            st.subheader("Dose-Response Curves")
+            fig = go.Figure()
+            colors = px.colors.qualitative.Plotly
+            for i, group in enumerate(sorted(df[group_by_col].unique())):
+                color = colors[i % len(colors)]
+                group_df_plot = df[df[group_by_col] == group]
+                fig.add_trace(go.Scatter(x=group_df_plot[conc_col], y=group_df_plot[y_var], mode='markers', name=f'Group {group} (data)', marker=dict(color=color)))
+                if not results_df[results_df['Group'] == group].empty:
+                    params = results_df[results_df['Group'] == group].iloc[0, 1:-1].values
+                    x_min = 0 
+                    x_max = group_df_plot[conc_col].max()
+                    x_range = np.linspace(x_min, x_max, 200)
+                    fit_func = five_pl if model_choice == "5PL" else four_pl
+                    y_pred = fit_func(x_range, *params)
+                    fig.add_trace(go.Scatter(x=x_range, y=y_pred, mode='lines', name=f'Group {group} (fit)', line=dict(color=color, dash='solid')))
+            fig.update_layout(xaxis_title=conc_col, yaxis_title=y_var, title="Dose-Response Analysis", legend_title_text='Group')
+            st.plotly_chart(fig, use_container_width=True)
+
+def handle_doe_modeling():
+    with st.container(border=True):
+        st.header("Step 3: DoE Modeling & Visualization", anchor="step-3-doe-modeling-visualization")
+        
+        base_df_tidy = st.session_state.get('df_tidy')
+        base_df_params = st.session_state.get('df_5pl_results')
+
+        if base_df_tidy is None:
+            st.info("Complete Step 1 to generate the data needed for this step.")
+            return
+
+        st.subheader("1. Define & Merge DoE Factors")
+        
+        grouping_col = st.selectbox("Select the column that defines your experimental groups:", options=base_df_tidy.columns, index=0)
+
+        if grouping_col:
+            unique_groups = pd.DataFrame(base_df_tidy[grouping_col].unique(), columns=[grouping_col]).sort_values(by=grouping_col).reset_index(drop=True)
+            st.write(f"Enter the DoE factor values for each unique group in **'{grouping_col}'**.")
+            
+            num_factors = st.number_input("Number of DoE Factors", min_value=1, value=1, key="ml_num_factors")
+            factor_names = [st.text_input(f"Factor {i+1} Name", f"DoE_Factor_{i+1}", key=f"ml_factor_name_{i}") for i in range(num_factors)]
+
+            doe_input_df = unique_groups.copy()
+            for name in factor_names:
+                doe_input_df[name] = 0.0
+            
+            edited_doe_df = st.data_editor(doe_input_df, key="doe_factor_editor", use_container_width=True)
+            
+            df_tidy_merged = pd.merge(base_df_tidy, edited_doe_df, on=grouping_col, how='left')
+            st.session_state.df_tidy_merged = df_tidy_merged
+            
+            if base_df_params is not None:
+                base_df_params_renamed = base_df_params.rename(columns={'Group': grouping_col})
+                df_params_merged = pd.merge(base_df_params_renamed, edited_doe_df, on=grouping_col, how='left')
+                st.session_state.df_5pl_results_merged = df_params_merged
+            
+            st.subheader("Checkpoint: Merged Tidy Data")
+            st.dataframe(st.session_state.df_tidy_merged)
+            if st.session_state.get('df_5pl_results_merged') is not None:
+                st.subheader("Checkpoint: Merged Dose-Response Results")
+                st.dataframe(st.session_state.df_5pl_results_merged)
+
+        st.subheader("2. Model Training & Interpretation")
+        
+        df_for_modeling = st.session_state.get('df_5pl_results_merged') if st.session_state.get('df_5pl_results_merged') is not None and not st.session_state.get('df_5pl_results_merged').empty else st.session_state.get('df_tidy_merged')
+
+        if df_for_modeling is None:
+            st.info("Please define and merge DoE factors above to proceed with modeling.")
+            return
+            
+        all_numeric_cols = df_for_modeling.select_dtypes(include=np.number).columns.tolist()
+        
+        target_col = st.selectbox("Select Target (Y):", all_numeric_cols, index=len(all_numeric_cols)-2 if 'R-squared' in all_numeric_cols else 0, key="target_col_selector")
+        features = st.multiselect("Select Features (X):", [col for col in factor_names if col in df_for_modeling.columns], default=[col for col in factor_names if col in df_for_modeling.columns], key="features_selector")
+
+        if not target_col or not features:
+            st.info("Select a target and at least one feature to begin analysis.")
+            return
+
+        with st.spinner("Training models and generating analyses..."):
+            X = df_for_modeling[features].dropna().drop_duplicates()
+            if X.empty:
+                st.warning("No data available for modeling after removing duplicates and missing values.")
+                return
+                
+            y = df_for_modeling.loc[X.index, target_col]
+            
+            poly = PolynomialFeatures(degree=len(features) if len(features) > 1 else 1, interaction_only=True, include_bias=False)
+            scaler = StandardScaler()
+            preprocessor = Pipeline([('poly', poly), ('scaler', scaler)])
+            X_processed = preprocessor.fit_transform(X)
+            poly_feature_names = preprocessor.named_steps['poly'].get_feature_names_out(features)
+
+            models = {
+                "Linear Model (RSM)": LinearRegression(),
+                "Random Forest": RandomForestRegressor(random_state=42),
+                "Gaussian Process (GPR)": GaussianProcessRegressor(kernel=C(1.0) * RBF(1.0) + WhiteKernel(0.1), random_state=42, n_restarts_optimizer=10)
+            }
+            
+            results = {}
+            # --- CHANGE: Add robust check for cross-validation ---
+            min_cv_samples = 5 
+            can_cv = len(X) >= min_cv_samples
+
+            for name, model in models.items():
+                model.fit(X_processed, y)
+                y_pred_full = model.predict(X_processed)
+                full_fit_r2 = r2_score(y, y_pred_full)
+                
+                if can_cv:
+                    cv_scores = cross_val_score(model, X_processed, y, cv=min_cv_samples, scoring='r2')
+                    cv_mean = cv_scores.mean()
+                    cv_std = cv_scores.std()
+                else:
+                    cv_mean, cv_std = np.nan, np.nan
+
+                results[name] = {"model": model, "full_fit_r2": full_fit_r2, "cv_mean_r2": cv_mean, "cv_std_r2": cv_std}
+            
+            st.subheader("Model Performance Comparison")
+            # --- CHANGE: Add explainer for CV ---
+            with st.expander("A Note on Model Validation (Full Fit vs. Cross-Validation)"):
+                st.markdown("""
+                In machine learning, we want to know how well our model will perform on *new, unseen data*.
+                
+                * **Full Fit R²**: This score shows how well the model fits the data it was trained on. A high score means the model learned the patterns in your current data very well. For sparse lab data, this is often the primary metric of interest to understand the relationships in the experiment.
+                * **Cross-Validated (CV) R²**: This is a more robust estimate of how the model will perform on *new* data. It works by splitting your data into several "folds" (e.g., 5), training the model on 4 folds, and testing it on the 1 fold it hasn't seen. This process is repeated 5 times, and the scores are averaged.
+                
+                **Why does CV sometimes fail or give a low score?**
+                With very small datasets (like in many DoE studies), there isn't enough data for this splitting process. The "test" set in each fold might be just one or two points, making the score unreliable. If CV was skipped, it's because the dataset was too small for a meaningful validation.
+                """)
+
+            if not can_cv:
+                st.warning(f"Cross-validation was skipped because the number of unique data points ({len(X)}) is less than the required minimum of {min_cv_samples}.")
+
+            perf_df = pd.DataFrame({"Model": results.keys(), "Full Fit R²": [r['full_fit_r2'] for r in results.values()], "CV Mean R²": [r['cv_mean_r2'] for r in results.values()], "CV R² Std Dev": [r['cv_std_r2'] for r in results.values()]}).set_index("Model")
+            st.dataframe(perf_df.style.format("{:.4f}", na_rep="N/A"))
+
+            # --- CHANGE: Base best model on Full Fit R² ---
+            best_model_name = perf_df['Full Fit R²'].idxmax()
+            st.success(f"🏆 **{best_model_name}** is the best model based on **Full Fit R²**.")
+            best_model = results[best_model_name]['model']
+
+            st.subheader("Feature Importance (SHAP)")
+            try:
+                with st.spinner("Calculating SHAP values..."):
+                    # For GPR, KernelExplainer can be slow. A sample can speed it up.
+                    X_summary = shap.sample(X_processed, 100) if len(X_processed) > 100 else X_processed
+                    explainer = shap.KernelExplainer(best_model.predict, X_summary)
+                    shap_values = explainer.shap_values(X_processed)
+                    fig_shap, ax_shap = plt.subplots(figsize=(10, 5))
+                    shap.summary_plot(shap_values, features=X_processed, feature_names=poly_feature_names, show=False, plot_size=None)
+                    plt.tight_layout()
+                    st.pyplot(fig_shap)
+            except Exception as e:
+                st.warning(f"Could not generate SHAP plot for {best_model_name}: {e}")
+
+            st.subheader("Interpretable Decision Tree Surrogate")
+            with st.spinner("Training and plotting surrogate decision tree..."):
+                surrogate_tree = DecisionTreeRegressor(max_depth=3, random_state=42)
+                y_pred_best_model = best_model.predict(X_processed)
+                surrogate_tree.fit(X_processed, y_pred_best_model)
+                fig_tree, ax_tree = plt.subplots(figsize=(20, 10))
+                plot_tree(surrogate_tree, feature_names=poly_feature_names, filled=True, rounded=True, ax=ax_tree, fontsize=10)
+                plt.title(f"Decision Tree Approximating the '{best_model_name}' Model")
+                st.pyplot(fig_tree)
+
+def handle_bayesian_optimization():
+    with st.container(border=True):
+        st.header("Step 4: Bayesian Optimization", anchor="step-4-bayesian-optimization")
+        st.info("This step is under construction.")
+        
 def handle_reporting():
-    """Manages the report generation and download section."""
-    st.subheader("Download Center")
-    st.info("Download your processed data and results as a multi-sheet Excel file.")
-    
-    dfs_to_download = {
-        "Raw_Data": st.session_state.df_raw,
-        "Tidy_Data": st.session_state.df_tidy,
-        "Dose_Response_Results": st.session_state.df_5pl_results,
-        "Tidy_Data_with_DoE": st.session_state.df_tidy_doe,
-        "Dose_Response_with_DoE": st.session_state.df_5pl_results_doe,
-        "AutoML_Results": st.session_state.automl_models
-    }
-    
-    st.markdown(get_excel_download_link(dfs_to_download, "LFA_Analysis_Report.xlsx"), unsafe_allow_html=True)
-    st.warning("PDF and PowerPoint downloads are under development.")
-
+    with st.container(border=True):
+        st.header("Step 5: Generate and Download Report", anchor="step-5-generate-and-download-report")
+        
+        if st.button("Generate Download Link"):
+            dfs_to_download = {
+                "Raw_Data": st.session_state.get('df_raw'),
+                "Tidy_Data": st.session_state.get('df_tidy'),
+                "Dose_Response_Results": st.session_state.get('df_5pl_results'),
+                "Tidy_Data_Merged_DoE": st.session_state.get('df_tidy_merged'),
+                "Params_Merged_DoE": st.session_state.get('df_5pl_results_merged')
+            }
+            st.markdown(get_excel_download_link(dfs_to_download, "LFA_Analysis_Report.xlsx"), unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

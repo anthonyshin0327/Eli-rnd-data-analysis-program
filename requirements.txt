@@ -3,6 +3,8 @@ pandas
 numpy
 plotly
 scikit-learn
-lazypredict
 scipy
-
+matplotlib
+shap
+scikit-optimize
+openpyxl
