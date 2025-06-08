@@ -84,7 +84,8 @@ def main():
             'df_doe_factors', 'df_tidy_doe', 'df_5pl_results_doe',
             'gpr_model', 'rsm_model', 'rf_model', 'doe_features', 'doe_model_r2',
             'y_scaler', 'x_preprocessor', 'target_col', 'performance_metrics',
-            'X_train', 'y_train', 'final_doe_df', 'df_tidy_merged', 'df_5pl_results_merged'
+            'X_train', 'y_train', 'final_doe_df', 'df_tidy_merged', 'df_5pl_results_merged',
+            'ml_results'
         ]
         for key in keys_to_init:
             if key not in st.session_state:
@@ -380,20 +381,20 @@ def handle_doe_modeling():
                 
             y = df_for_modeling.loc[X.index, target_col]
             
-            poly = PolynomialFeatures(degree=len(features) if len(features) > 1 else 1, interaction_only=True, include_bias=False)
+            # --- CHANGE: Use degree=2 for a full quadratic model ---
+            poly = PolynomialFeatures(degree=2, include_bias=False)
             scaler = StandardScaler()
             preprocessor = Pipeline([('poly', poly), ('scaler', scaler)])
             X_processed = preprocessor.fit_transform(X)
             poly_feature_names = preprocessor.named_steps['poly'].get_feature_names_out(features)
 
             models = {
-                "Linear Model (RSM)": LinearRegression(),
+                "Quadratic Model (RSM)": LinearRegression(),
                 "Random Forest": RandomForestRegressor(random_state=42),
                 "Gaussian Process (GPR)": GaussianProcessRegressor(kernel=C(1.0) * RBF(1.0) + WhiteKernel(0.1), random_state=42, n_restarts_optimizer=10)
             }
             
             results = {}
-            # --- CHANGE: Add robust check for cross-validation ---
             min_cv_samples = 5 
             can_cv = len(X) >= min_cv_samples
 
@@ -402,17 +403,21 @@ def handle_doe_modeling():
                 y_pred_full = model.predict(X_processed)
                 full_fit_r2 = r2_score(y, y_pred_full)
                 
+                cv_mean, cv_std = (np.nan, np.nan)
                 if can_cv:
-                    cv_scores = cross_val_score(model, X_processed, y, cv=min_cv_samples, scoring='r2')
-                    cv_mean = cv_scores.mean()
-                    cv_std = cv_scores.std()
-                else:
-                    cv_mean, cv_std = np.nan, np.nan
+                    try:
+                        cv_scores = cross_val_score(model, X_processed, y, cv=min_cv_samples, scoring='r2')
+                        cv_mean = cv_scores.mean()
+                        cv_std = cv_scores.std()
+                    except Exception:
+                        pass 
 
                 results[name] = {"model": model, "full_fit_r2": full_fit_r2, "cv_mean_r2": cv_mean, "cv_std_r2": cv_std}
             
+            st.session_state.ml_results = results
+            st.session_state.preprocessor = preprocessor
+            
             st.subheader("Model Performance Comparison")
-            # --- CHANGE: Add explainer for CV ---
             with st.expander("A Note on Model Validation (Full Fit vs. Cross-Validation)"):
                 st.markdown("""
                 In machine learning, we want to know how well our model will perform on *new, unseen data*.
@@ -430,15 +435,44 @@ def handle_doe_modeling():
             perf_df = pd.DataFrame({"Model": results.keys(), "Full Fit R²": [r['full_fit_r2'] for r in results.values()], "CV Mean R²": [r['cv_mean_r2'] for r in results.values()], "CV R² Std Dev": [r['cv_std_r2'] for r in results.values()]}).set_index("Model")
             st.dataframe(perf_df.style.format("{:.4f}", na_rep="N/A"))
 
-            # --- CHANGE: Base best model on Full Fit R² ---
             best_model_name = perf_df['Full Fit R²'].idxmax()
             st.success(f"🏆 **{best_model_name}** is the best model based on **Full Fit R²**.")
             best_model = results[best_model_name]['model']
 
+            st.subheader("Response Surface Plot")
+            if len(features) == 1:
+                fig_rsm = go.Figure()
+                x_range = pd.DataFrame(np.linspace(X.iloc[:,0].min(), X.iloc[:,0].max(), 100), columns=features)
+                x_range_processed = preprocessor.transform(x_range)
+                y_pred_rsm = best_model.predict(x_range_processed)
+                
+                fig_rsm.add_trace(go.Scatter(x=x_range.iloc[:,0], y=y_pred_rsm, mode='lines', name='Model Prediction'))
+                fig_rsm.add_trace(go.Scatter(x=X.iloc[:,0], y=y, mode='markers', name='Original Data', marker=dict(color='red')))
+                fig_rsm.update_layout(title=f'Response Surface: {target_col} vs {features[0]}', xaxis_title=features[0], yaxis_title=target_col)
+                st.plotly_chart(fig_rsm, use_container_width=True)
+
+            elif len(features) == 2:
+                x1_range = np.linspace(X.iloc[:,0].min(), X.iloc[:,0].max(), 50)
+                x2_range = np.linspace(X.iloc[:,1].min(), X.iloc[:,1].max(), 50)
+                x1_grid, x2_grid = np.meshgrid(x1_range, x2_range)
+                grid_df = pd.DataFrame(np.c_[x1_grid.ravel(), x2_grid.ravel()], columns=features)
+                
+                grid_processed = preprocessor.transform(grid_df)
+                y_pred_grid = best_model.predict(grid_processed).reshape(x1_grid.shape)
+                
+                fig_rsm = go.Figure(data=[
+                    go.Surface(z=y_pred_grid, x=x1_grid, y=x2_grid, colorscale='Viridis', opacity=0.7, name='Predicted Surface'),
+                    go.Scatter3d(x=X.iloc[:,0], y=X.iloc[:,1], z=y, mode='markers', name='Original Data', marker=dict(color='red', size=5))
+                ])
+                fig_rsm.update_layout(title=f'Response Surface: {target_col}', scene=dict(xaxis_title=features[0], yaxis_title=features[1], zaxis_title=target_col))
+                st.plotly_chart(fig_rsm, use_container_width=True)
+            else:
+                st.info("Response surface plots are only available for 1 or 2 features.")
+
+
             st.subheader("Feature Importance (SHAP)")
             try:
                 with st.spinner("Calculating SHAP values..."):
-                    # For GPR, KernelExplainer can be slow. A sample can speed it up.
                     X_summary = shap.sample(X_processed, 100) if len(X_processed) > 100 else X_processed
                     explainer = shap.KernelExplainer(best_model.predict, X_summary)
                     shap_values = explainer.shap_values(X_processed)
