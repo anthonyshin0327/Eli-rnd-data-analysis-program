@@ -21,6 +21,20 @@ import matplotlib.pyplot as plt
 import shap
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
+import tempfile
+import os
+from datetime import datetime
+import shutil
+
+# --- New Imports for Export Features ---
+from fpdf import FPDF
+import plotly.io as pio
+try:
+    import kaleido
+except ImportError:
+    st.warning("Kaleido package not found. Static image export for Plotly figures will not be available. Please install it using 'pip install kaleido'")
+import subprocess
+import textwrap
 
 # --- Model Imports ---
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -28,7 +42,6 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKern
 from skopt import gp_minimize
 from skopt.space import Real
 from skopt.utils import use_named_args
-# NOTE: skopt.plots are no longer used to avoid errors.
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -41,7 +54,7 @@ st.set_page_config(
 # --- Suppress Warnings for Cleaner Output ---
 warnings.filterwarnings("ignore")
 
-# --- Helper Functions ---
+# --- Helper Functions for App Logic---
 
 def five_pl(x, a, b, c, d, g):
     """5-Parameter Logistic Regression model function."""
@@ -59,6 +72,8 @@ def four_pl(x, a, b, c, d):
         val = d + (a - d) / (1 + np.exp(b * (np.log(x_safe) - np.log(c))))
     return val
 
+# --- Helper Functions for Reporting ---
+
 def get_excel_download_link(dfs_dict, filename):
     """Generates a link to download a multi-sheet Excel file."""
     output = BytesIO()
@@ -74,8 +89,134 @@ def get_excel_download_link(dfs_dict, filename):
     href = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}">Download Full Report (XLSX)</a>'
     return href
 
+def save_plotly_figure_as_image(fig, filename):
+    """Save a plotly figure as PNG image."""
+    try:
+        pio.write_image(fig, filename, width=800, height=500, scale=2)
+        return True
+    except Exception as e:
+        st.warning(f"Could not save Plotly figure {os.path.basename(filename)}: {e}")
+        return False
 
-# --- Main App ---
+def save_matplotlib_figure_as_image(fig, filename):
+    """Save a matplotlib figure as PNG image."""
+    try:
+        fig.savefig(filename, dpi=300, bbox_inches='tight', facecolor='white')
+        return True
+    except Exception as e:
+        st.warning(f"Could not save Matplotlib figure {os.path.basename(filename)}: {e}")
+        return False
+
+class PDF(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 12)
+        self.cell(0, 10, 'LFA Analysis & ML Suite Report', 0, 1, 'C')
+        self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+
+    def chapter_title(self, title):
+        self.set_font('Arial', 'B', 16)
+        self.cell(0, 10, title, 0, 1, 'L')
+        self.ln(5)
+
+    def chapter_body(self, content):
+        self.set_font('Arial', '', 12)
+        self.multi_cell(0, 10, content)
+        self.ln()
+
+    def add_df_to_pdf(self, df, title):
+        self.set_font('Arial', 'B', 12)
+        self.cell(0, 10, title, 0, 1, 'L')
+        self.ln(4)
+
+        self.set_font('Arial', 'B', 8)
+        
+        # Dynamically calculate column widths
+        page_width = self.w - 2*self.l_margin
+        num_cols = len(df.columns)
+        col_width = page_width / num_cols
+        
+        for i, header in enumerate(df.columns):
+            self.cell(col_width, 10, str(header), 1, 0, 'C')
+        self.ln()
+        
+        self.set_font('Arial', '', 8)
+        for index, row in df.iterrows():
+            for i, item in enumerate(row):
+                 self.cell(col_width, 10, str(item), 1, 0, 'C')
+            self.ln()
+        self.ln(10)
+
+def create_pdf_report(temp_dir):
+    pdf = PDF()
+    pdf.add_page()
+    
+    # Title Page
+    pdf.set_font('Arial', 'B', 24)
+    pdf.cell(0, 20, 'LFA Analysis & ML Suite Report', 0, 1, 'C')
+    pdf.set_font('Arial', '', 12)
+    pdf.cell(0, 10, f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 0, 1, 'C')
+    pdf.ln(20)
+
+    # --- Data Section ---
+    if st.session_state.get('df_tidy') is not None:
+        pdf.add_page()
+        pdf.chapter_title("1. Data Overview")
+        pdf.chapter_body(f"The raw dataset contains {st.session_state.df_raw.shape[0]} rows and {st.session_state.df_raw.shape[1]} columns. After preprocessing, the tidy dataset contains {st.session_state.df_tidy.shape[0]} rows and {st.session_state.df_tidy.shape[1]} columns.")
+        
+    # --- Dose-Response Section ---
+    if 'dose_response_fig' in st.session_state and st.session_state.dose_response_fig:
+        pdf.add_page()
+        pdf.chapter_title("2. Dose-Response Analysis")
+        img_path = os.path.join(temp_dir, "dose_response.png")
+        if save_plotly_figure_as_image(st.session_state.dose_response_fig, img_path):
+            pdf.image(img_path, w=180)
+            
+    # --- Modeling Section ---
+    if 'ml_results' in st.session_state and st.session_state.ml_results:
+        pdf.add_page()
+        pdf.chapter_title("3. DoE Modeling & Visualization")
+        
+        perf_df = pd.DataFrame({"Model": st.session_state.ml_results.keys(), "Full Fit R²": [r['full_fit_r2'] for r in st.session_state.ml_results.values()]})
+        pdf.add_df_to_pdf(perf_df, "Model Performance")
+        
+        if 'rsm_fig' in st.session_state and st.session_state.rsm_fig:
+            img_path = os.path.join(temp_dir, "rsm_plot.png")
+            if save_plotly_figure_as_image(st.session_state.rsm_fig, img_path):
+                pdf.image(img_path, w=180)
+
+    # --- Optimization Section ---
+    if 'batch_suggestions' in st.session_state and st.session_state.batch_suggestions is not None:
+        pdf.add_page()
+        pdf.chapter_title("4. Bayesian Optimization")
+        
+        if st.session_state.get('global_optimum') is not None:
+            pdf.chapter_body(f"Global Optimum Predicted Value: {st.session_state.global_optimum['prediction']:.4f}")
+
+        pdf.add_df_to_pdf(st.session_state.batch_suggestions, "Suggested Experiments")
+
+        if 'opt_landscape_fig' in st.session_state and st.session_state.opt_landscape_fig:
+            img_path = os.path.join(temp_dir, "opt_landscape.png")
+            if save_plotly_figure_as_image(st.session_state.opt_landscape_fig, img_path):
+                pdf.image(img_path, w=160)
+
+    pdf_path = os.path.join(temp_dir, "report.pdf")
+    pdf.output(pdf_path)
+    return pdf_path
+
+def get_pdf_download_link(pdf_file_path, filename):
+    """Generate download link for PDF file."""
+    with open(pdf_file_path, "rb") as f:
+        pdf_data = f.read()
+    b64 = base64.b64encode(pdf_data).decode()
+    href = f'<a href="data:application/pdf;base64,{b64}" download="{filename}">Download PDF Report (.pdf)</a>'
+    return href
+
+# --- Main App Body ---
 def main():
     """Main function to run the Streamlit application."""
     with st.sidebar:
@@ -90,7 +231,8 @@ def main():
             'y_scaler', 'x_preprocessor', 'target_col', 'performance_metrics',
             'X_train', 'y_train', 'final_doe_df', 'df_tidy_merged', 'df_5pl_results_merged',
             'ml_results', 'opt_result', 'modeling_df_for_opt', 'features_for_opt', 'target_for_opt',
-            'batch_suggestions', 'global_optimum'
+            'batch_suggestions', 'global_optimum', 'preprocessor', 'dose_response_fig', 
+            'rsm_fig', 'shap_fig', 'tree_fig', 'opt_landscape_fig', 'opt_convergence_fig'
         ]
         for key in keys_to_init:
             if key not in st.session_state:
@@ -105,7 +247,6 @@ def main():
 
         if uploaded_file:
             try:
-                # Reset state on new file upload
                 for key in keys_to_init:
                     if key == 'data_source':
                         continue
@@ -328,6 +469,7 @@ def handle_dose_response_regression():
                     y_pred = fit_func(x_range, *params)
                     fig.add_trace(go.Scatter(x=x_range, y=y_pred, mode='lines', name=f'Group {group} (fit)', line=dict(color=color, dash='solid')))
             fig.update_layout(xaxis_title=conc_col, yaxis_title=y_var, title="Dose-Response Analysis", legend_title_text='Group')
+            st.session_state.dose_response_fig = fig
             st.plotly_chart(fig, use_container_width=True)
 
 def handle_doe_modeling():
@@ -407,7 +549,6 @@ def handle_doe_modeling():
         target_col = st.selectbox("Select Target (Y):", all_numeric_cols, key="target_col_selector")
         features = st.multiselect("Select Features (X):", feature_options, default=feature_options, key="features_selector")
         
-        # Store selections for Step 4
         st.session_state.modeling_df_for_opt = df_for_modeling
         st.session_state.features_for_opt = features
         st.session_state.target_for_opt = target_col
@@ -434,7 +575,7 @@ def handle_doe_modeling():
             models = {
                 "Quadratic Model (RSM)": LinearRegression(),
                 "Random Forest": RandomForestRegressor(random_state=42),
-                "Gaussian Process (GPR)": GaussianProcessRegressor(kernel=C(1.0) * RBF(1.0) + WhiteKernel(0.1), random_state=42, n_restarts_optimizer=10)
+                "Gaussian Process (GPR)": GaussianProcessRegressor(kernel=C(1.0) * RBF(1.0) + WhiteKernel(0.1), random_state=42, n_restarts_optimizer=15)
             }
             
             results = {}
@@ -476,7 +617,6 @@ def handle_doe_modeling():
 
             st.subheader("ANOVA Analysis for Quadratic Model")
             try:
-                # FIX: More robust data cleaning for ANOVA
                 formula_df = df_for_modeling[[target_col] + features].copy()
                 formula_df = formula_df.apply(pd.to_numeric, errors='coerce')
                 formula_df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -559,6 +699,7 @@ def handle_doe_modeling():
                 st.info("Response surface plots are only available for 1 or 2 features. ANOVA and other analyses are still performed.")
             
             if fig:
+                st.session_state.rsm_fig = fig
                 st.plotly_chart(fig, use_container_width=True)
 
 
@@ -571,6 +712,7 @@ def handle_doe_modeling():
                     fig_shap, ax_shap = plt.subplots(figsize=(10, 5))
                     shap.summary_plot(shap_values, features=X_processed, feature_names=poly_feature_names, show=False, plot_size=None)
                     plt.tight_layout()
+                    st.session_state.shap_fig = fig_shap
                     st.pyplot(fig_shap)
             except Exception as e:
                 st.warning(f"Could not generate SHAP plot for {best_model_name}: {e}")
@@ -583,6 +725,7 @@ def handle_doe_modeling():
                 fig_tree, ax_tree = plt.subplots(figsize=(20, 10))
                 plot_tree(surrogate_tree, feature_names=poly_feature_names, filled=True, rounded=True, ax=ax_tree, fontsize=10)
                 plt.title(f"Decision Tree Approximating the '{best_model_name}' Model")
+                st.session_state.tree_fig = fig_tree
                 st.pyplot(fig_tree)
 
 def handle_bayesian_optimization():
@@ -614,7 +757,6 @@ def handle_bayesian_optimization():
 
         if st.button("Suggest Next Batch of Experiments"):
             with st.spinner("Searching for optimal conditions..."):
-                # Run a single optimization to get a good surrogate model
                 ml_results = st.session_state.ml_results
                 preprocessor = st.session_state.preprocessor
                 df_for_modeling = st.session_state.modeling_df_for_opt
@@ -640,7 +782,6 @@ def handle_bayesian_optimization():
                     prediction = best_model.predict(point_processed)[0]
                     return -prediction if goal == "Maximize" else prediction
                 
-                # We run gp_minimize to get a trained GPR model (the surrogate)
                 result = gp_minimize(
                     func=objective,
                     dimensions=search_space,
@@ -652,20 +793,16 @@ def handle_bayesian_optimization():
                 )
                 st.session_state.opt_result = result
                 
-                # Now, use the trained GPR to generate batch suggestions
                 gpr = result.models[-1]
                 
-                # --- NEW: Find Global Optimum of the Surrogate ---
                 def surrogate_objective(x):
                     return gpr.predict(np.array(x).reshape(1, -1))[0]
                 
                 bounds = [(dim.low, dim.high) for dim in result.space.dimensions]
                 
-                # Find the global minimum of the surrogate
                 global_min_result = minimize(surrogate_objective, result.x, bounds=bounds, method='L-BFGS-B')
                 global_optimum_point = global_min_result.x
                 
-                # Predict this point with the original best model
                 global_optimum_point_df = pd.DataFrame([global_optimum_point], columns=features)
                 global_optimum_point_processed = preprocessor.transform(global_optimum_point_df)
                 global_optimum_prediction = best_model.predict(global_optimum_point_processed)[0]
@@ -675,7 +812,6 @@ def handle_bayesian_optimization():
                     "prediction": global_optimum_prediction
                 }
 
-                # --- Generate Batch Suggestions ---
                 suggestions = []
                 suggestions.append({
                     'point': global_optimum_point,
@@ -693,7 +829,6 @@ def handle_bayesian_optimization():
                         ei = imp * norm.cdf(Z) + std * norm.pdf(Z)
                         ei[std == 0.0] = 0.0
 
-                    # Filter points close to the global optimum
                     dist_to_best = np.sqrt(np.sum((grid_points - global_optimum_point)**2, axis=1))
                     mask = dist_to_best > 0.01
                     
@@ -720,7 +855,6 @@ def handle_bayesian_optimization():
                             if not is_close:
                                 suggestions.append({'point': point_to_add, 'strategy': 'Balanced (High EI)'})
                 
-                # Finalize suggestion dataframe
                 suggestion_points = np.array([s['point'] for s in suggestions])
                 suggestion_df = pd.DataFrame(suggestion_points, columns=features)
                 suggestion_df['Suggestion Strategy'] = [s['strategy'] for s in suggestions]
@@ -735,7 +869,7 @@ def handle_bayesian_optimization():
 
                 st.session_state.batch_suggestions = suggestion_df
 
-        # --- Display KPI and Batch Suggestions ---
+
         if 'global_optimum' in st.session_state and st.session_state.global_optimum is not None:
              st.subheader(f"Global Optimum Found")
              st.metric(f"Best Predicted {st.session_state.target_for_opt}", f"{st.session_state.global_optimum['prediction']:.4f}")
@@ -747,7 +881,6 @@ def handle_bayesian_optimization():
             df_to_display['Confidence (%)'] = df_to_display['Confidence (%)'].map('{:.1f}'.format)
             st.dataframe(df_to_display)
         
-        # --- Display Visualizations from the single optimization run ---
         if 'opt_result' in st.session_state and st.session_state.opt_result is not None:
             st.subheader("3. Visualization of the Optimization Landscape")
             result = st.session_state.opt_result
@@ -758,7 +891,7 @@ def handle_bayesian_optimization():
                 try:
                     with st.spinner("Generating diagnostic plots..."):
                         gpr = result.models[-1]
-                        optimal_point = st.session_state.global_optimum['point'] # Use the global optimum for plotting
+                        optimal_point = st.session_state.global_optimum['point'] 
                         n_features = len(features)
 
                         if n_features == 2:
@@ -804,6 +937,7 @@ def handle_bayesian_optimization():
                             fig.update_layout(height=500, width=500, title_text="Objective and Partial Dependence", showlegend=False)
                             fig.update_xaxes(title_text=features[0], row=2, col=1); fig.update_yaxes(title_text=features[1], row=2, col=1)
                             fig.update_yaxes(title_text="Partial Dep.", showticklabels=False, row=1, col=1); fig.update_xaxes(title_text="Partial Dep.", showticklabels=False, row=2, col=4)
+                            st.session_state.opt_landscape_fig = fig
                             st.plotly_chart(fig, use_container_width=False)
 
                         else:
@@ -821,15 +955,18 @@ def handle_bayesian_optimization():
                                 fig.add_trace(go.Scatter(x=np.concatenate([feature_range, feature_range[::-1]]), y=np.concatenate([predictions - 1.96 * std, (predictions + 1.96 * std)[::-1]]), fill='toself', fillcolor='rgba(0,100,80,0.2)', line=dict(color='rgba(255,255,255,0)')), row=row, col=col)
                                 fig.add_vline(x=optimal_point[i], line_dash="dash", line_color="red", row=row, col=col)
                             fig.update_layout(height=300 * n_rows, title_text="Partial Dependence Plots", showlegend=False)
+                            st.session_state.opt_landscape_fig = fig
                             st.plotly_chart(fig, use_container_width=True)
 
                         st.write("#### Convergence Trace")
-                        objective_values = np.array(result.func_vals)
-                        if goal == "Maximize": objective_values = -objective_values
-                        best_seen = np.minimum.accumulate(objective_values) if goal == "Minimize" else np.maximum.accumulate(objective_values)
+                        true_convergence = best_model.predict(preprocessor.transform(result.x_iters))
+                        if goal == "Maximize": best_seen = np.maximum.accumulate(true_convergence)
+                        else: best_seen = np.minimum.accumulate(true_convergence)
+                        
                         fig_conv = go.Figure()
                         fig_conv.add_trace(go.Scatter(x=list(range(1, len(best_seen) + 1)), y=best_seen, mode='lines+markers', line=dict(color='green')))
                         fig_conv.update_layout(title="Convergence Trace", xaxis_title="Iteration", yaxis_title=f"Best Seen {st.session_state.target_for_opt}", height=400)
+                        st.session_state.opt_convergence_fig = fig_conv
                         st.plotly_chart(fig_conv, use_container_width=True)
 
                 except Exception as e:
@@ -840,18 +977,28 @@ def handle_reporting():
     with st.container(border=True):
         st.header("Step 5: Generate and Download Report", anchor="step-5-generate-and-download-report")
         
-        if st.button("Generate Download Link"):
-            dfs_to_download = {
-                "Raw_Data": st.session_state.get('df_raw'),
-                "Tidy_Data": st.session_state.get('df_tidy'),
-                "Dose_Response_Results": st.session_state.get('df_5pl_results'),
-                "Tidy_Data_Merged_DoE": st.session_state.get('df_tidy_merged'),
-                "Params_Merged_DoE": st.session_state.get('df_5pl_results_merged')
-            }
-            if st.session_state.get('batch_suggestions') is not None:
-                 dfs_to_download["Optimization_Suggestions"] = st.session_state.batch_suggestions
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Generate PDF Report"):
+                with st.spinner("Creating PDF report..."):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        pdf_path = create_pdf_report(temp_dir)
+                        if pdf_path:
+                            st.markdown(get_pdf_download_link(pdf_path, "LFA_Analysis_Report.pdf"), unsafe_allow_html=True)
+        with c2:
+            if st.button("Generate Excel Report"):
+                 dfs_to_download = {
+                    "Raw_Data": st.session_state.get('df_raw'),
+                    "Tidy_Data": st.session_state.get('df_tidy'),
+                    "Dose_Response_Results": st.session_state.get('df_5pl_results'),
+                    "Tidy_Data_Merged_DoE": st.session_state.get('df_tidy_merged'),
+                    "Params_Merged_DoE": st.session_state.get('df_5pl_results_merged')
+                }
+                 if st.session_state.get('batch_suggestions') is not None:
+                     dfs_to_download["Optimization_Suggestions"] = st.session_state.batch_suggestions
 
-            st.markdown(get_excel_download_link(dfs_to_download, "LFA_Analysis_Report.xlsx"), unsafe_allow_html=True)
+                 st.markdown(get_excel_download_link(dfs_to_download, "LFA_Analysis_Report.xlsx"), unsafe_allow_html=True)
+
 
 if __name__ == "__main__":
     main()

@@ -6,7 +6,8 @@ scikit-learn
 scipy
 matplotlib
 shap
-scikit-optimize
-openpyxl
 statsmodels
-python-pptx
+kaleido
+scikit-optimize
+fpdf2
+
