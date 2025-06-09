@@ -3,9 +3,8 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
@@ -15,16 +14,14 @@ from scipy.optimize import curve_fit
 from io import BytesIO
 import base64
 import warnings
-import itertools
 import matplotlib.pyplot as plt
 import shap
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
 
 # --- Model Imports ---
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
-from skopt import gp_minimize
-from skopt.space import Real
-from skopt.utils import use_named_args
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -139,6 +136,7 @@ def main():
         st.info("Awaiting data file upload in the sidebar...")
 
 def handle_lumos_processing():
+    """Handles the preprocessing of LUMOS-specific data."""
     with st.container(border=True):
         st.header("Step 1: Data Preprocessing", anchor="step-1-data-preprocessing")
         
@@ -205,6 +203,7 @@ def handle_lumos_processing():
             st.dataframe(st.session_state.df_tidy)
         
 def handle_dose_response_regression():
+    """Handles fitting 4PL/5PL models to the data."""
     with st.container(border=True):
         st.header("Step 2: Dose-Response Analysis", anchor="step-2-dose-response-analysis")
         if st.session_state.get('df_tidy') is None:
@@ -222,16 +221,24 @@ def handle_dose_response_regression():
         model_choice = st.radio("Select Model", ("5PL", "4PL"), key="dr_model_choice", horizontal=True)
         
         y_vars = ['T', 'C', 'T_norm', 'C_norm', 'T-C', 'C/T', 'T/C', 'T+C']
-        all_cols = st.session_state.df_tidy.columns
-        group_cols = [c for c in all_cols if c not in y_vars and pd.api.types.is_numeric_dtype(st.session_state.df_tidy[c])]
+        all_cols = st.session_state.df_tidy.columns.tolist()
         
-        if not group_cols:
-            st.error("No suitable numeric grouping or concentration columns found in the Tidy Data.")
+        concentration_options = [c for c in all_cols if c not in y_vars and pd.api.types.is_numeric_dtype(st.session_state.df_tidy[c])]
+        grouping_options = [c for c in all_cols if c not in y_vars]
+        
+        if not concentration_options:
+            st.error("No suitable numeric columns for 'Concentration' found in the Tidy Data.")
             return
 
         col1, col2, col3 = st.columns(3)
-        conc_col = col1.selectbox("Concentration column:", group_cols, key="dr_conc_col")
-        group_by_col = col2.selectbox("Group analysis by:", group_cols, key="dr_group_col", help="A model will be fit for each unique value in this column.")
+        conc_col = col1.selectbox("Concentration column:", concentration_options, key="dr_conc_col")
+        
+        group_by_col = col2.selectbox(
+            "Group analysis by:", 
+            grouping_options, 
+            key="dr_group_col", 
+            help="A model will be fit for each unique value in this column."
+        )
         y_var = col3.selectbox("Response variable (Y-axis):", y_vars, key="dr_y_var", index=2)
         
         with st.spinner("Fitting models..."):
@@ -284,7 +291,7 @@ def handle_dose_response_regression():
                 st.markdown("""
                 <style>
                 div[data-testid="stMetric"] {
-                    background-color: #e8f5e9;
+                    background-color: #E8F5E9;
                     border: 1px solid #4CAF50;
                     padding: 1rem;
                     border-radius: 0.5rem;
@@ -315,6 +322,7 @@ def handle_dose_response_regression():
             st.plotly_chart(fig, use_container_width=True)
 
 def handle_doe_modeling():
+    """Handles DoE factor definition, model training, and visualization."""
     with st.container(border=True):
         st.header("Step 3: DoE Modeling & Visualization", anchor="step-3-doe-modeling-visualization")
         
@@ -358,16 +366,39 @@ def handle_doe_modeling():
 
         st.subheader("2. Model Training & Interpretation")
         
-        df_for_modeling = st.session_state.get('df_5pl_results_merged') if st.session_state.get('df_5pl_results_merged') is not None and not st.session_state.get('df_5pl_results_merged').empty else st.session_state.get('df_tidy_merged')
+        # --- NEW: Data source selection for modeling ---
+        modeling_source_options = []
+        if st.session_state.get('df_tidy_merged') is not None:
+            modeling_source_options.append("Merged Tidy Data")
+        if st.session_state.get('df_5pl_results_merged') is not None:
+            modeling_source_options.append("Merged Dose-Response Results")
 
-        if df_for_modeling is None:
+        if not modeling_source_options:
             st.info("Please define and merge DoE factors above to proceed with modeling.")
             return
-            
+
+        modeling_source = st.radio(
+            "Select data source for modeling:",
+            options=modeling_source_options,
+            horizontal=True
+        )
+
+        df_for_modeling = None
+        if modeling_source == "Merged Tidy Data":
+            df_for_modeling = st.session_state.get('df_tidy_merged')
+        else: # Merged Dose-Response Results
+            df_for_modeling = st.session_state.get('df_5pl_results_merged')
+
+        if df_for_modeling is None:
+            st.error("Selected modeling data source is not available.")
+            return
+
+        # Dynamically populate target and feature options
         all_numeric_cols = df_for_modeling.select_dtypes(include=np.number).columns.tolist()
+        feature_options = [col for col in factor_names if col in df_for_modeling.columns]
         
-        target_col = st.selectbox("Select Target (Y):", all_numeric_cols, index=len(all_numeric_cols)-2 if 'R-squared' in all_numeric_cols else 0, key="target_col_selector")
-        features = st.multiselect("Select Features (X):", [col for col in factor_names if col in df_for_modeling.columns], default=[col for col in factor_names if col in df_for_modeling.columns], key="features_selector")
+        target_col = st.selectbox("Select Target (Y):", all_numeric_cols, key="target_col_selector")
+        features = st.multiselect("Select Features (X):", feature_options, default=feature_options, key="features_selector")
 
         if not target_col or not features:
             st.info("Select a target and at least one feature to begin analysis.")
@@ -381,7 +412,6 @@ def handle_doe_modeling():
                 
             y = df_for_modeling.loc[X.index, target_col]
             
-            # --- CHANGE: Use degree=2 for a full quadratic model ---
             poly = PolynomialFeatures(degree=2, include_bias=False)
             scaler = StandardScaler()
             preprocessor = Pipeline([('poly', poly), ('scaler', scaler)])
@@ -410,7 +440,7 @@ def handle_doe_modeling():
                         cv_mean = cv_scores.mean()
                         cv_std = cv_scores.std()
                     except Exception:
-                        pass 
+                        pass
 
                 results[name] = {"model": model, "full_fit_r2": full_fit_r2, "cv_mean_r2": cv_mean, "cv_std_r2": cv_std}
             
@@ -418,26 +448,75 @@ def handle_doe_modeling():
             st.session_state.preprocessor = preprocessor
             
             st.subheader("Model Performance Comparison")
-            with st.expander("A Note on Model Validation (Full Fit vs. Cross-Validation)"):
-                st.markdown("""
-                In machine learning, we want to know how well our model will perform on *new, unseen data*.
-                
-                * **Full Fit R²**: This score shows how well the model fits the data it was trained on. A high score means the model learned the patterns in your current data very well. For sparse lab data, this is often the primary metric of interest to understand the relationships in the experiment.
-                * **Cross-Validated (CV) R²**: This is a more robust estimate of how the model will perform on *new* data. It works by splitting your data into several "folds" (e.g., 5), training the model on 4 folds, and testing it on the 1 fold it hasn't seen. This process is repeated 5 times, and the scores are averaged.
-                
-                **Why does CV sometimes fail or give a low score?**
-                With very small datasets (like in many DoE studies), there isn't enough data for this splitting process. The "test" set in each fold might be just one or two points, making the score unreliable. If CV was skipped, it's because the dataset was too small for a meaningful validation.
-                """)
-
-            if not can_cv:
-                st.warning(f"Cross-validation was skipped because the number of unique data points ({len(X)}) is less than the required minimum of {min_cv_samples}.")
 
             perf_df = pd.DataFrame({"Model": results.keys(), "Full Fit R²": [r['full_fit_r2'] for r in results.values()], "CV Mean R²": [r['cv_mean_r2'] for r in results.values()], "CV R² Std Dev": [r['cv_std_r2'] for r in results.values()]}).set_index("Model")
             st.dataframe(perf_df.style.format("{:.4f}", na_rep="N/A"))
 
             best_model_name = perf_df['Full Fit R²'].idxmax()
-            st.success(f"🏆 **{best_model_name}** is the best model based on **Full Fit R²**.")
+            best_model_r2 = perf_df['Full Fit R²'].max()
             best_model = results[best_model_name]['model']
+
+            # --- NEW: Best Model KPI Card ---
+            st.subheader("🏆 Best Model")
+            c1, c2 = st.columns(2)
+            c1.metric("Model Name", best_model_name)
+            c2.metric("Full Fit R²", f"{best_model_r2:.4f}")
+
+            # --- NEW: ANOVA Analysis ---
+            st.subheader("ANOVA Analysis for Quadratic Model")
+            try:
+                # Prepare data for statsmodels
+                formula_df = df_for_modeling[[target_col] + features].dropna().drop_duplicates()
+                # Clean column names for formula
+                clean_target = target_col.replace('+', '_plus_').replace('-', '_minus_').replace('/', '_div_')
+                clean_features = [f.replace('+', '_plus_').replace('-', '_minus_').replace('/', '_div_') for f in features]
+                formula_df.columns = [clean_target] + clean_features
+
+                # Build the formula string for a full quadratic model
+                formula_terms = []
+                # Add main effects
+                formula_terms.extend(clean_features)
+                # Add interaction effects
+                if len(clean_features) > 1:
+                    formula_terms.extend([f"{p[0]}*{p[1]}" for p in list(itertools.combinations(clean_features, 2))])
+                # Add quadratic effects
+                formula_terms.extend([f"I({f}**2)" for f in clean_features])
+                
+                formula = f"{clean_target} ~ {' + '.join(formula_terms)}"
+                
+                # Fit the OLS model
+                ols_model = ols(formula, data=formula_df).fit()
+                anova_table = sm.stats.anova_lm(ols_model, typ=2)
+                st.write("ANOVA Table:")
+                st.dataframe(anova_table.style.format('{:.4f}'))
+
+                # Interpret ANOVA results
+                alpha = 0.05
+                significant_factors = anova_table[anova_table['PR(>F)'] < alpha].index.tolist()
+                non_significant_factors = anova_table[anova_table['PR(>F)'] >= alpha].index.tolist()
+                
+                st.subheader("ANOVA Interpretation")
+                st.markdown(f"""
+                Analysis of Variance (ANOVA) helps us understand which factors significantly affect the response variable, **{target_col}**. We test this by looking at the p-value (`PR(>F)`). The p-value tells us the probability of observing our results if the factor actually has no effect.
+
+                A common threshold for significance (alpha, α) is **{alpha}**.
+                - If **p-value < {alpha}**, we conclude the factor has a statistically significant effect.
+                - If **p-value ≥ {alpha}**, we conclude there isn't enough evidence to say the factor has an effect.
+                """)
+
+                if significant_factors:
+                    st.success(f"**Significant Factors (p < {alpha}):** " + ", ".join(significant_factors))
+                else:
+                    st.info(f"**Significant Factors (p < {alpha}):** None")
+
+                if non_significant_factors:
+                    st.warning(f"**Non-Significant Factors (p ≥ {alpha}):** " + ", ".join(non_significant_factors))
+                else:
+                    st.info(f"**Non-Significant Factors (p ≥ {alpha}):** None")
+
+            except Exception as e:
+                st.error(f"Could not perform ANOVA: {e}")
+
 
             st.subheader("Response Surface Plot")
             if len(features) == 1:
@@ -467,8 +546,7 @@ def handle_doe_modeling():
                 fig_rsm.update_layout(title=f'Response Surface: {target_col}', scene=dict(xaxis_title=features[0], yaxis_title=features[1], zaxis_title=target_col))
                 st.plotly_chart(fig_rsm, use_container_width=True)
             else:
-                st.info("Response surface plots are only available for 1 or 2 features.")
-
+                st.info("Response surface plots and ANOVA are only available for 1 or 2 features.")
 
             st.subheader("Feature Importance (SHAP)")
             try:
@@ -494,11 +572,13 @@ def handle_doe_modeling():
                 st.pyplot(fig_tree)
 
 def handle_bayesian_optimization():
+    """Placeholder for Bayesian Optimization functionality."""
     with st.container(border=True):
         st.header("Step 4: Bayesian Optimization", anchor="step-4-bayesian-optimization")
         st.info("This step is under construction.")
         
 def handle_reporting():
+    """Handles the generation of a downloadable Excel report."""
     with st.container(border=True):
         st.header("Step 5: Generate and Download Report", anchor="step-5-generate-and-download-report")
         
