@@ -11,7 +11,8 @@ from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.tree import DecisionTreeRegressor, plot_tree
 from sklearn.metrics import r2_score
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, minimize
+from scipy.stats import norm
 from io import BytesIO
 import base64
 import warnings
@@ -88,7 +89,8 @@ def main():
             'gpr_model', 'rsm_model', 'rf_model', 'doe_features', 'doe_model_r2',
             'y_scaler', 'x_preprocessor', 'target_col', 'performance_metrics',
             'X_train', 'y_train', 'final_doe_df', 'df_tidy_merged', 'df_5pl_results_merged',
-            'ml_results', 'opt_result', 'modeling_df_for_opt', 'features_for_opt', 'target_for_opt'
+            'ml_results', 'opt_result', 'modeling_df_for_opt', 'features_for_opt', 'target_for_opt',
+            'batch_suggestions'
         ]
         for key in keys_to_init:
             if key not in st.session_state:
@@ -578,19 +580,31 @@ def handle_bayesian_optimization():
     with st.container(border=True):
         st.header("Step 4: Bayesian Optimization", anchor="step-4-bayesian-optimization")
 
-        # Check for model and data from Step 3
         if 'ml_results' not in st.session_state or st.session_state.ml_results is None:
             st.info("Complete Step 3 to train a model before running optimization.")
             return
         
-        # --- Optimization Settings ---
         st.subheader("1. Optimization Settings")
-        goal = st.radio("Optimization Goal:", ("Minimize", "Maximize"), horizontal=True, key="opt_goal")
-        n_calls = st.number_input("Number of search iterations:", min_value=10, value=25, key="opt_n_calls")
+        c1, c2 = st.columns(2)
+        goal = c1.radio("Optimization Goal:", ("Minimize", "Maximize"), horizontal=True, key="opt_goal")
+        batch_size = c2.number_input("Number of experiments to suggest:", min_value=1, max_value=10, value=3, key="batch_size")
 
-        if st.button("Run Bayesian Optimization"):
+        with st.expander("How are batch suggestions generated?"):
+            st.markdown("""
+            This tool uses a powerful AI-driven approach based on **Bayesian Optimization** to suggest the most informative experiments to run next. It balances two key strategies, similar to modern Design of Experiments (DoE):
+
+            - **Exploitation:** Suggesting points where the model predicts the best outcome based on current knowledge. This helps to quickly refine and confirm the optimal conditions. The **'Best Predicted'** point is a pure exploitation strategy.
+
+            - **Exploration:** Suggesting points in regions where the model is most uncertain. This helps to improve the model's accuracy and discover new, potentially better, experimental regions that you might have missed. The **'Highest Uncertainty'** point is a pure exploration strategy.
+
+            - **Balanced Approach:** The **'High Expected Improvement'** points represent a sophisticated trade-off between exploitation and exploration. They are points that have a high probability of being better than the current best *and* a reasonable amount of uncertainty.
+
+            By providing a batch of suggestions based on these different strategies, the tool helps you efficiently learn about your experimental space and converge on the true optimum faster.
+            """)
+
+        if st.button("Suggest Next Batch of Experiments"):
             with st.spinner("Searching for optimal conditions..."):
-                # Get necessary objects from session state
+                # Run a single optimization to get a good surrogate model
                 ml_results = st.session_state.ml_results
                 preprocessor = st.session_state.preprocessor
                 df_for_modeling = st.session_state.modeling_df_for_opt
@@ -601,104 +615,87 @@ def handle_bayesian_optimization():
                 best_model = ml_results[best_model_name]['model']
                 X = df_for_modeling[features].dropna().drop_duplicates()
                 
-                # Define search space with 10% extrapolation
                 search_space = []
                 for feature in features:
                     min_val = X[feature].min()
                     max_val = X[feature].max()
-                    # Handle cases where min and max are the same
                     ext = (max_val - min_val) * 0.10 if max_val > min_val else abs(min_val) * 0.10 or 0.1
                     search_space.append(Real(min_val - ext, max_val + ext, name=feature))
 
-                # Define the objective function for the optimizer
                 @use_named_args(search_space)
                 def objective(**params):
                     point = pd.DataFrame([params])
-                    point = point[features]  # Ensure correct column order
+                    point = point[features]
                     point_processed = preprocessor.transform(point)
                     prediction = best_model.predict(point_processed)[0]
                     return -prediction if goal == "Maximize" else prediction
-
-                # Run the optimization
-                result = gp_minimize(
-                    func=objective,
-                    dimensions=search_space,
-                    n_calls=n_calls,
-                    random_state=42,
-                    acq_func="EI"  # Expected Improvement
-                )
+                
+                # We run gp_minimize to get a trained GPR model (the surrogate)
+                result = gp_minimize(func=objective, dimensions=search_space, n_calls=20, random_state=42, acq_func="EI")
                 st.session_state.opt_result = result
+                
+                # Now, use the trained GPR to generate batch suggestions
+                gpr = result.models[-1]
+                
+                # Generate a large sample of points to evaluate
+                grid_points = result.space.rvs(n_samples=1000, random_state=42)
+                mu, std = gpr.predict(grid_points, return_std=True)
+                
+                if goal == 'Maximize':
+                    mu = -mu
+                
+                y_best = result.fun
+                
+                # Calculate Expected Improvement (EI)
+                with np.errstate(divide='warn'):
+                    imp = y_best - mu
+                    Z = imp / std
+                    ei = imp * norm.cdf(Z) + std * norm.pdf(Z)
+                    ei[std == 0.0] = 0.0
+
+                suggestions = []
+                # Suggestion 1: Best predicted
+                best_idx = np.argmin(mu)
+                suggestions.append({'point': grid_points[best_idx], 'strategy': 'Exploitation (Best Predicted)'})
+
+                # Suggestion 2: Highest Uncertainty
+                if batch_size > 1:
+                    uncertainty_idx = np.argmax(std)
+                    suggestions.append({'point': grid_points[uncertainty_idx], 'strategy': 'Exploration (Highest Uncertainty)'})
+
+                # Subsequent suggestions from EI
+                if batch_size > 2:
+                    ei_sorted_indices = np.argsort(ei)[::-1]
+                    for idx in ei_sorted_indices:
+                        if len(suggestions) >= batch_size: break
+                        point_to_add = grid_points[idx]
+                        # Check if it's too close to existing suggestions
+                        is_close = False
+                        for sug in suggestions:
+                            if np.allclose(sug['point'], point_to_add, atol=0.01):
+                                is_close = True
+                                break
+                        if not is_close:
+                            suggestions.append({'point': point_to_add, 'strategy': 'Balanced (High EI)'})
+                
+                suggestion_df = pd.DataFrame([s['point'] for s in suggestions], columns=features)
+                suggestion_df['Suggestion Strategy'] = [s['strategy'] for s in suggestions]
+                st.session_state.batch_suggestions = suggestion_df
+
+
+        # --- Display Batch Suggestions ---
+        if 'batch_suggestions' in st.session_state and st.session_state.batch_suggestions is not None:
+            st.subheader("2. Suggested Batch of Experiments")
+            st.dataframe(st.session_state.batch_suggestions)
         
-        # --- Display Optimization Results ---
+        # --- Display Visualizations from the single optimization run ---
         if 'opt_result' in st.session_state and st.session_state.opt_result is not None:
+            st.subheader("3. Visualization of the Optimization Landscape")
             result = st.session_state.opt_result
             features = st.session_state.features_for_opt
-            goal = st.session_state.get('opt_goal', 'Minimize') # Get goal from session state
+            goal = st.session_state.get('opt_goal', 'Minimize')
             
-            st.subheader("2. Optimization Results")
-            opt_val = -result.fun if goal == "Maximize" else result.fun
-            
-            st.metric(f"Optimal Predicted {st.session_state.target_for_opt}", f"{opt_val:.4f}")
-
-            st.write("Optimal conditions found:")
-            opt_conditions = pd.DataFrame([result.x], columns=features)
-            st.dataframe(opt_conditions)
-
-            st.subheader("3. Visualization")
-            
-            # --- Interactive Plotly plot for 1D/2D ---
-            if len(features) <= 2:
-                with st.spinner("Generating interactive plot..."):
-                    # Get original data
-                    X_orig = st.session_state.modeling_df_for_opt[features].dropna().drop_duplicates()
-                    y_orig = st.session_state.modeling_df_for_opt.loc[X_orig.index, st.session_state.target_for_opt]
-                    
-                    # Get evaluated points
-                    eval_points = pd.DataFrame(result.x_iters, columns=features)
-                    eval_vals = -np.array(result.func_vals) if goal == "Maximize" else np.array(result.func_vals)
-                    eval_points[st.session_state.target_for_opt] = eval_vals
-
-                    # Get optimal point
-                    opt_point = opt_conditions.copy()
-                    opt_point[st.session_state.target_for_opt] = opt_val
-
-                    if len(features) == 1:
-                        perf_df = pd.DataFrame({"Model": st.session_state.ml_results.keys(), "Full Fit R²": [r['full_fit_r2'] for r in st.session_state.ml_results.values()]}).set_index("Model")
-                        fig = go.Figure()
-                        # Plot response surface
-                        x_range = pd.DataFrame(np.linspace(X_orig.iloc[:,0].min(), X_orig.iloc[:,0].max(), 100), columns=features)
-                        x_range_processed = st.session_state.preprocessor.transform(x_range)
-                        y_pred_rsm = st.session_state.ml_results[perf_df['Full Fit R²'].idxmax()]['model'].predict(x_range_processed)
-                        fig.add_trace(go.Scatter(x=x_range.iloc[:,0], y=y_pred_rsm, mode='lines', name='Model Prediction', line=dict(color='lightblue')))
-                        
-                        # Plot original, evaluated, and optimal points
-                        fig.add_trace(go.Scatter(x=X_orig.iloc[:,0], y=y_orig, mode='markers', name='Original Data', marker=dict(color='grey')))
-                        fig.add_trace(go.Scatter(x=eval_points.iloc[:,0], y=eval_points[st.session_state.target_for_opt], mode='markers', name='Evaluated Points', marker=dict(color='blue')))
-                        fig.add_trace(go.Scatter(x=opt_point.iloc[:,0], y=opt_point[st.session_state.target_for_opt], mode='markers', name='Predicted Optimum', marker=dict(color='red', symbol='star', size=15)))
-                        fig.update_layout(title="Optimization Path", xaxis_title=features[0], yaxis_title=st.session_state.target_for_opt)
-                        st.plotly_chart(fig, use_container_width=True)
-
-                    elif len(features) == 2:
-                        perf_df = pd.DataFrame({"Model": st.session_state.ml_results.keys(), "Full Fit R²": [r['full_fit_r2'] for r in st.session_state.ml_results.values()]}).set_index("Model")
-                        fig = go.Figure()
-                        # Plot response surface
-                        x1_range = np.linspace(X_orig.iloc[:,0].min(), X_orig.iloc[:,0].max(), 100)
-                        x2_range = np.linspace(X_orig.iloc[:,1].min(), X_orig.iloc[:,1].max(), 100)
-                        x1_grid, x2_grid = np.meshgrid(x1_range, x2_range)
-                        grid_df = pd.DataFrame(np.c_[x1_grid.ravel(), x2_grid.ravel()], columns=features)
-                        grid_processed = st.session_state.preprocessor.transform(grid_df)
-                        y_pred_grid = st.session_state.ml_results[perf_df['Full Fit R²'].idxmax()]['model'].predict(grid_processed).reshape(x1_grid.shape)
-                        fig.add_trace(go.Surface(z=y_pred_grid, x=x1_grid, y=x2_grid, colorscale='Viridis', opacity=0.5, name='Predicted Surface'))
-                        
-                        # Plot points
-                        fig.add_trace(go.Scatter3d(x=X_orig.iloc[:,0], y=X_orig.iloc[:,1], z=y_orig, mode='markers', name='Original Data', marker=dict(color='grey')))
-                        fig.add_trace(go.Scatter3d(x=eval_points.iloc[:,0], y=eval_points.iloc[:,1], z=eval_points[st.session_state.target_for_opt], mode='markers', name='Evaluated Points', marker=dict(color='blue')))
-                        fig.add_trace(go.Scatter3d(x=opt_point.iloc[:,0], y=opt_point.iloc[:,1], z=opt_point[st.session_state.target_for_opt], mode='markers', name='Predicted Optimum', marker=dict(color='red', symbol='diamond', size=8)))
-                        fig.update_layout(title="Optimization Path", scene=dict(xaxis_title=features[0], yaxis_title=features[1], zaxis_title=st.session_state.target_for_opt))
-                        st.plotly_chart(fig, use_container_width=True)
-
-            # --- Custom Diagnostic Plots (Rebuilt with Plotly) ---
-            with st.expander("Show Diagnostic Plots"):
+            with st.expander("Show Diagnostic Plots", expanded=True):
                 try:
                     with st.spinner("Generating diagnostic plots..."):
                         gpr = result.models[-1]
@@ -708,7 +705,6 @@ def handle_bayesian_optimization():
                         if n_features == 2:
                             st.write("#### Objective and Partial Dependence Plots")
                             
-                            # Create a gridspec for layout
                             fig = make_subplots(
                                 rows=4, cols=4,
                                 specs=[[{"colspan": 3}, None, None, None],
@@ -718,7 +714,6 @@ def handle_bayesian_optimization():
                                 vertical_spacing=0.05, horizontal_spacing=0.05
                             )
 
-                            # Main contour plot data
                             x1_range = np.linspace(result.space.dimensions[0].low, result.space.dimensions[0].high, 40)
                             x2_range = np.linspace(result.space.dimensions[1].low, result.space.dimensions[1].high, 40)
                             x1_grid, x2_grid = np.meshgrid(x1_range, x2_range)
@@ -727,49 +722,39 @@ def handle_bayesian_optimization():
                             if goal == "Maximize": predictions = -predictions
                             x_iters = np.array(result.x_iters)
 
-                            # Main contour plot traces
                             fig.add_trace(go.Contour(z=predictions, x=x1_range, y=x2_range, colorscale='Viridis', showscale=False), row=2, col=1)
-                            fig.add_trace(go.Scatter(x=x_iters[:, 0], y=x_iters[:, 1], mode='markers', marker=dict(color='rgba(128,128,128,0.7)'), name='Evaluated'), row=2, col=1)
+                            fig.add_trace(go.Scatter(x=x_iters[:, 0], y=x_iters[:, 1], mode='markers', marker=dict(color='rgba(0,0,0,0.7)', symbol='x'), name='Evaluated'), row=2, col=1)
                             fig.add_trace(go.Scatter(x=[optimal_point[0]], y=[optimal_point[1]], mode='markers', marker=dict(color='red', symbol='star', size=15), name='Optimum'), row=2, col=1)
-
-                            # Partial dependence on top axis
+                            
                             feature_range_top = np.linspace(result.space.dimensions[0].low, result.space.dimensions[0].high, 100)
-                            eval_points_top = np.tile(optimal_point, (100, 1))
-                            eval_points_top[:, 0] = feature_range_top
+                            eval_points_top = np.tile(optimal_point, (100, 1)); eval_points_top[:, 0] = feature_range_top
                             preds_top, std_top = gpr.predict(eval_points_top, return_std=True)
                             if goal == "Maximize": preds_top = -preds_top
                             fig.add_trace(go.Scatter(x=feature_range_top, y=preds_top, mode='lines', line=dict(color='blue')), row=1, col=1)
                             fig.add_trace(go.Scatter(x=np.concatenate([feature_range_top, feature_range_top[::-1]]), y=np.concatenate([preds_top - std_top, (preds_top + std_top)[::-1]]), fill='toself', fillcolor='rgba(0,100,80,0.2)', line=dict(color='rgba(255,255,255,0)'), name='Confidence'), row=1, col=1)
                             fig.add_vline(x=optimal_point[0], line_dash="dash", line_color="red", row=1, col=1)
 
-                            # Partial dependence on right axis
                             feature_range_right = np.linspace(result.space.dimensions[1].low, result.space.dimensions[1].high, 100)
-                            eval_points_right = np.tile(optimal_point, (100, 1))
-                            eval_points_right[:, 1] = feature_range_right
+                            eval_points_right = np.tile(optimal_point, (100, 1)); eval_points_right[:, 1] = feature_range_right
                             preds_right, std_right = gpr.predict(eval_points_right, return_std=True)
                             if goal == "Maximize": preds_right = -preds_right
                             fig.add_trace(go.Scatter(y=feature_range_right, x=preds_right, mode='lines', line=dict(color='blue')), row=2, col=4)
                             fig.add_trace(go.Scatter(y=np.concatenate([feature_range_right, feature_range_right[::-1]]), x=np.concatenate([preds_right - std_right, (preds_right + std_right)[::-1]]), fill='toself', fillcolor='rgba(0,100,80,0.2)', line=dict(color='rgba(255,255,255,0)')), row=2, col=4)
                             fig.add_hline(y=optimal_point[1], line_dash="dash", line_color="red", row=2, col=4)
                             
-                            fig.update_layout(height=600, width=600, title_text="Objective and Partial Dependence", showlegend=False)
-                            fig.update_xaxes(title_text=features[0], row=2, col=1)
-                            fig.update_yaxes(title_text=features[1], row=2, col=1)
-                            fig.update_yaxes(title_text="Partial Dep.", showticklabels=False, row=1, col=1)
-                            fig.update_xaxes(title_text="Partial Dep.", showticklabels=False, row=2, col=4)
-                            st.plotly_chart(fig, use_container_width=True)
+                            fig.update_layout(height=500, width=500, title_text="Objective and Partial Dependence", showlegend=False)
+                            fig.update_xaxes(title_text=features[0], row=2, col=1); fig.update_yaxes(title_text=features[1], row=2, col=1)
+                            fig.update_yaxes(title_text="Partial Dep.", showticklabels=False, row=1, col=1); fig.update_xaxes(title_text="Partial Dep.", showticklabels=False, row=2, col=4)
+                            st.plotly_chart(fig, use_container_width=False)
 
-                        else: # Fallback for 1 or >2 features
+                        else:
                             st.write("#### Partial Dependence Plots")
-                            n_cols = min(n_features, 2)
-                            n_rows = (n_features + n_cols - 1) // n_cols
+                            n_cols = min(n_features, 2); n_rows = (n_features + n_cols - 1) // n_cols
                             fig = make_subplots(rows=n_rows, cols=n_cols, subplot_titles=features)
                             for i, feature in enumerate(features):
-                                row = i // n_cols + 1
-                                col = i % n_cols + 1
+                                row = i // n_cols + 1; col = i % n_cols + 1
                                 feature_range = np.linspace(result.space.dimensions[i].low, result.space.dimensions[i].high, 100)
-                                eval_points_pd = np.tile(optimal_point, (100, 1))
-                                eval_points_pd[:, i] = feature_range
+                                eval_points_pd = np.tile(optimal_point, (100, 1)); eval_points_pd[:, i] = feature_range
                                 predictions, std = gpr.predict(eval_points_pd, return_std=True)
                                 if goal == "Maximize": predictions = -predictions
                                 
@@ -779,7 +764,6 @@ def handle_bayesian_optimization():
                             fig.update_layout(height=300 * n_rows, title_text="Partial Dependence Plots", showlegend=False)
                             st.plotly_chart(fig, use_container_width=True)
 
-                        # Always show Convergence plot
                         st.write("#### Convergence Trace")
                         objective_values = np.array(result.func_vals)
                         if goal == "Maximize": objective_values = -objective_values
@@ -805,16 +789,8 @@ def handle_reporting():
                 "Tidy_Data_Merged_DoE": st.session_state.get('df_tidy_merged'),
                 "Params_Merged_DoE": st.session_state.get('df_5pl_results_merged')
             }
-            if st.session_state.get('opt_result'):
-                res = st.session_state.get('opt_result')
-                goal = st.session_state.get('opt_goal', 'Minimize') # Get goal, default to Minimize
-                opt_df = pd.DataFrame(res.x_iters, columns=st.session_state.features_for_opt)
-                
-                target_values = -np.array(res.func_vals) if goal == "Maximize" else np.array(res.func_vals)
-                opt_df['predicted_target_value'] = target_values
-                
-                sort_ascending = goal == "Minimize"
-                dfs_to_download["Optimization_Suggestions"] = opt_df.sort_values('predicted_target_value', ascending=sort_ascending).reset_index(drop=True)
+            if st.session_state.get('batch_suggestions') is not None:
+                 dfs_to_download["Optimization_Suggestions"] = st.session_state.batch_suggestions
 
             st.markdown(get_excel_download_link(dfs_to_download, "LFA_Analysis_Report.xlsx"), unsafe_allow_html=True)
 
