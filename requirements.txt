@@ -9,3 +9,4 @@ shap
 scikit-optimize
 openpyxl
 statsmodels
+python-pptx
