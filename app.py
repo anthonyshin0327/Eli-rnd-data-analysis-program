@@ -23,6 +23,10 @@ from statsmodels.formula.api import ols
 # --- Model Imports ---
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+from skopt import gp_minimize
+from skopt.space import Real
+from skopt.utils import use_named_args
+from skopt.plots import plot_objective, plot_evaluations
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -83,7 +87,7 @@ def main():
             'gpr_model', 'rsm_model', 'rf_model', 'doe_features', 'doe_model_r2',
             'y_scaler', 'x_preprocessor', 'target_col', 'performance_metrics',
             'X_train', 'y_train', 'final_doe_df', 'df_tidy_merged', 'df_5pl_results_merged',
-            'ml_results'
+            'ml_results', 'opt_result', 'modeling_df_for_opt', 'features_for_opt', 'target_for_opt'
         ]
         for key in keys_to_init:
             if key not in st.session_state:
@@ -98,6 +102,7 @@ def main():
 
         if uploaded_file:
             try:
+                # Reset state on new file upload
                 for key in keys_to_init:
                     if key == 'data_source':
                         continue
@@ -398,6 +403,12 @@ def handle_doe_modeling():
         
         target_col = st.selectbox("Select Target (Y):", all_numeric_cols, key="target_col_selector")
         features = st.multiselect("Select Features (X):", feature_options, default=feature_options, key="features_selector")
+        
+        # Store selections for Step 4
+        st.session_state.modeling_df_for_opt = df_for_modeling
+        st.session_state.features_for_opt = features
+        st.session_state.target_for_opt = target_col
+
 
         if not target_col or not features:
             st.info("Select a target and at least one feature to begin analysis.")
@@ -487,7 +498,6 @@ def handle_doe_modeling():
                 st.subheader("ANOVA Interpretation")
                 st.markdown(f"""
                 Analysis of Variance (ANOVA) helps us understand which factors significantly affect the response variable, **{target_col}**. We test this by looking at the p-value (`PR(>F)`). The p-value tells us the probability of observing our results if the factor actually has no effect.
-
                 A common threshold for significance (alpha, α) is **{alpha}**.
                 - If **p-value < {alpha}**, we conclude the factor has a statistically significant effect.
                 - If **p-value ≥ {alpha}**, we conclude there isn't enough evidence to say the factor has an effect.
@@ -505,7 +515,6 @@ def handle_doe_modeling():
 
             except Exception as e:
                 st.error(f"Could not perform ANOVA: {e}")
-
 
             st.subheader("Response Surface Plot")
             if len(features) == 1:
@@ -561,11 +570,139 @@ def handle_doe_modeling():
                 st.pyplot(fig_tree)
 
 def handle_bayesian_optimization():
-    """Placeholder for Bayesian Optimization functionality."""
+    """Performs Bayesian Optimization to find optimal experimental conditions."""
     with st.container(border=True):
         st.header("Step 4: Bayesian Optimization", anchor="step-4-bayesian-optimization")
-        st.info("This step is under construction.")
+
+        # Check for model and data from Step 3
+        if 'ml_results' not in st.session_state or st.session_state.ml_results is None:
+            st.info("Complete Step 3 to train a model before running optimization.")
+            return
         
+        # --- Optimization Settings ---
+        st.subheader("1. Optimization Settings")
+        goal = st.radio("Optimization Goal:", ("Minimize", "Maximize"), horizontal=True, key="opt_goal")
+        n_calls = st.number_input("Number of search iterations:", min_value=10, value=25, key="opt_n_calls")
+
+        if st.button("Run Bayesian Optimization"):
+            with st.spinner("Searching for optimal conditions..."):
+                # Get necessary objects from session state
+                ml_results = st.session_state.ml_results
+                preprocessor = st.session_state.preprocessor
+                df_for_modeling = st.session_state.modeling_df_for_opt
+                features = st.session_state.features_for_opt
+                
+                perf_df = pd.DataFrame({"Model": ml_results.keys(), "Full Fit R²": [r['full_fit_r2'] for r in ml_results.values()]}).set_index("Model")
+                best_model_name = perf_df['Full Fit R²'].idxmax()
+                best_model = ml_results[best_model_name]['model']
+                X = df_for_modeling[features].dropna().drop_duplicates()
+                
+                # Define search space with 10% extrapolation
+                search_space = []
+                for feature in features:
+                    min_val = X[feature].min()
+                    max_val = X[feature].max()
+                    # Handle cases where min and max are the same
+                    ext = (max_val - min_val) * 0.10 if max_val > min_val else abs(min_val) * 0.10 or 0.1
+                    search_space.append(Real(min_val - ext, max_val + ext, name=feature))
+
+                # Define the objective function for the optimizer
+                @use_named_args(search_space)
+                def objective(**params):
+                    point = pd.DataFrame([params])
+                    point = point[features]  # Ensure correct column order
+                    point_processed = preprocessor.transform(point)
+                    prediction = best_model.predict(point_processed)[0]
+                    return -prediction if goal == "Maximize" else prediction
+
+                # Run the optimization
+                result = gp_minimize(
+                    func=objective,
+                    dimensions=search_space,
+                    n_calls=n_calls,
+                    random_state=42,
+                    acq_func="EI"  # Expected Improvement
+                )
+                st.session_state.opt_result = result
+        
+        # --- Display Optimization Results ---
+        if 'opt_result' in st.session_state and st.session_state.opt_result is not None:
+            result = st.session_state.opt_result
+            features = st.session_state.features_for_opt
+            
+            st.subheader("2. Optimization Results")
+            opt_val = -result.fun if goal == "Maximize" else result.fun
+            
+            st.metric(f"Optimal Predicted {st.session_state.target_for_opt}", f"{opt_val:.4f}")
+
+            st.write("Optimal conditions found:")
+            opt_conditions = pd.DataFrame([result.x], columns=features)
+            st.dataframe(opt_conditions)
+
+            st.subheader("3. Visualization")
+            
+            # --- Interactive Plotly plot for 1D/2D ---
+            if len(features) <= 2:
+                with st.spinner("Generating interactive plot..."):
+                    # Get original data
+                    X_orig = st.session_state.modeling_df_for_opt[features].dropna().drop_duplicates()
+                    y_orig = st.session_state.modeling_df_for_opt.loc[X_orig.index, st.session_state.target_for_opt]
+                    
+                    # Get evaluated points
+                    eval_points = pd.DataFrame(result.x_iters, columns=features)
+                    eval_vals = -np.array(result.func_vals) if goal == "Maximize" else np.array(result.func_vals)
+                    eval_points[st.session_state.target_for_opt] = eval_vals
+
+                    # Get optimal point
+                    opt_point = opt_conditions.copy()
+                    opt_point[st.session_state.target_for_opt] = opt_val
+
+                    if len(features) == 1:
+                        fig = go.Figure()
+                        # Plot response surface
+                        x_range = pd.DataFrame(np.linspace(X_orig.iloc[:,0].min(), X_orig.iloc[:,0].max(), 100), columns=features)
+                        x_range_processed = st.session_state.preprocessor.transform(x_range)
+                        y_pred_rsm = st.session_state.ml_results[perf_df['Full Fit R²'].idxmax()]['model'].predict(x_range_processed)
+                        fig.add_trace(go.Scatter(x=x_range.iloc[:,0], y=y_pred_rsm, mode='lines', name='Model Prediction', line=dict(color='lightblue')))
+                        
+                        # Plot original, evaluated, and optimal points
+                        fig.add_trace(go.Scatter(x=X_orig.iloc[:,0], y=y_orig, mode='markers', name='Original Data', marker=dict(color='grey')))
+                        fig.add_trace(go.Scatter(x=eval_points.iloc[:,0], y=eval_points.iloc[:,1], mode='markers', name='Evaluated Points', marker=dict(color='blue')))
+                        fig.add_trace(go.Scatter(x=opt_point.iloc[:,0], y=opt_point.iloc[:,1], mode='markers', name='Predicted Optimum', marker=dict(color='red', symbol='star', size=15)))
+                        fig.update_layout(title="Optimization Path", xaxis_title=features[0], yaxis_title=st.session_state.target_for_opt)
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    elif len(features) == 2:
+                        fig = go.Figure()
+                        # Plot response surface
+                        x1_range = np.linspace(X_orig.iloc[:,0].min(), X_orig.iloc[:,0].max(), 100)
+                        x2_range = np.linspace(X_orig.iloc[:,1].min(), X_orig.iloc[:,1].max(), 100)
+                        x1_grid, x2_grid = np.meshgrid(x1_range, x2_range)
+                        grid_df = pd.DataFrame(np.c_[x1_grid.ravel(), x2_grid.ravel()], columns=features)
+                        grid_processed = st.session_state.preprocessor.transform(grid_df)
+                        y_pred_grid = st.session_state.ml_results[perf_df['Full Fit R²'].idxmax()]['model'].predict(grid_processed).reshape(x1_grid.shape)
+                        fig.add_trace(go.Surface(z=y_pred_grid, x=x1_grid, y=x2_grid, colorscale='Viridis', opacity=0.5, name='Predicted Surface'))
+                        
+                        # Plot points
+                        fig.add_trace(go.Scatter3d(x=X_orig.iloc[:,0], y=X_orig.iloc[:,1], z=y_orig, mode='markers', name='Original Data', marker=dict(color='grey')))
+                        fig.add_trace(go.Scatter3d(x=eval_points.iloc[:,0], y=eval_points.iloc[:,1], z=eval_points.iloc[:,2], mode='markers', name='Evaluated Points', marker=dict(color='blue')))
+                        fig.add_trace(go.Scatter3d(x=opt_point.iloc[:,0], y=opt_point.iloc[:,1], z=opt_point.iloc[:,2], mode='markers', name='Predicted Optimum', marker=dict(color='red', symbol='diamond', size=8)))
+                        fig.update_layout(title="Optimization Path", scene=dict(xaxis_title=features[0], yaxis_title=features[1], zaxis_title=st.session_state.target_for_opt))
+                        st.plotly_chart(fig, use_container_width=True)
+
+            # --- Skopt diagnostic plots ---
+            with st.expander("Show skopt diagnostic plots"):
+                try:
+                    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+                    plot_objective(result, ax=ax, dimensions=features)
+                    st.pyplot(fig)
+
+                    fig2, ax2 = plt.subplots(1, 1, figsize=(8, 6))
+                    plot_evaluations(result, ax=ax2, dimensions=features)
+                    st.pyplot(fig2)
+                except Exception as e:
+                    st.warning(f"Could not generate skopt plots: {e}")
+
 def handle_reporting():
     """Handles the generation of a downloadable Excel report."""
     with st.container(border=True):
@@ -579,6 +716,12 @@ def handle_reporting():
                 "Tidy_Data_Merged_DoE": st.session_state.get('df_tidy_merged'),
                 "Params_Merged_DoE": st.session_state.get('df_5pl_results_merged')
             }
+            if st.session_state.get('opt_result'):
+                res = st.session_state.get('opt_result')
+                opt_df = pd.DataFrame(res.x_iters, columns=st.session_state.features_for_opt)
+                opt_df['target_value'] = res.func_vals
+                dfs_to_download["Optimization_Suggestions"] = opt_df.sort_values('target_value').reset_index(drop=True)
+
             st.markdown(get_excel_download_link(dfs_to_download, "LFA_Analysis_Report.xlsx"), unsafe_allow_html=True)
 
 if __name__ == "__main__":
