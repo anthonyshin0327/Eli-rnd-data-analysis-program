@@ -14,6 +14,7 @@ from scipy.optimize import curve_fit
 from io import BytesIO
 import base64
 import warnings
+import itertools
 import matplotlib.pyplot as plt
 import shap
 import statsmodels.api as sm
@@ -366,7 +367,6 @@ def handle_doe_modeling():
 
         st.subheader("2. Model Training & Interpretation")
         
-        # --- NEW: Data source selection for modeling ---
         modeling_source_options = []
         if st.session_state.get('df_tidy_merged') is not None:
             modeling_source_options.append("Merged Tidy Data")
@@ -386,14 +386,13 @@ def handle_doe_modeling():
         df_for_modeling = None
         if modeling_source == "Merged Tidy Data":
             df_for_modeling = st.session_state.get('df_tidy_merged')
-        else: # Merged Dose-Response Results
+        else:
             df_for_modeling = st.session_state.get('df_5pl_results_merged')
 
         if df_for_modeling is None:
             st.error("Selected modeling data source is not available.")
             return
 
-        # Dynamically populate target and feature options
         all_numeric_cols = df_for_modeling.select_dtypes(include=np.number).columns.tolist()
         feature_options = [col for col in factor_names if col in df_for_modeling.columns]
         
@@ -456,41 +455,31 @@ def handle_doe_modeling():
             best_model_r2 = perf_df['Full Fit R²'].max()
             best_model = results[best_model_name]['model']
 
-            # --- NEW: Best Model KPI Card ---
             st.subheader("🏆 Best Model")
             c1, c2 = st.columns(2)
             c1.metric("Model Name", best_model_name)
             c2.metric("Full Fit R²", f"{best_model_r2:.4f}")
 
-            # --- NEW: ANOVA Analysis ---
             st.subheader("ANOVA Analysis for Quadratic Model")
             try:
-                # Prepare data for statsmodels
                 formula_df = df_for_modeling[[target_col] + features].dropna().drop_duplicates()
-                # Clean column names for formula
-                clean_target = target_col.replace('+', '_plus_').replace('-', '_minus_').replace('/', '_div_')
-                clean_features = [f.replace('+', '_plus_').replace('-', '_minus_').replace('/', '_div_') for f in features]
+                clean_target = ''.join(c if c.isalnum() else '_' for c in target_col)
+                clean_features = [''.join(c if c.isalnum() else '_' for c in f) for f in features]
                 formula_df.columns = [clean_target] + clean_features
 
-                # Build the formula string for a full quadratic model
-                formula_terms = []
-                # Add main effects
-                formula_terms.extend(clean_features)
-                # Add interaction effects
                 if len(clean_features) > 1:
-                    formula_terms.extend([f"{p[0]}*{p[1]}" for p in list(itertools.combinations(clean_features, 2))])
-                # Add quadratic effects
-                formula_terms.extend([f"I({f}**2)" for f in clean_features])
+                    main_and_interaction = f"({' + '.join(clean_features)})**2"
+                else:
+                    main_and_interaction = ' + '.join(clean_features)
                 
-                formula = f"{clean_target} ~ {' + '.join(formula_terms)}"
-                
-                # Fit the OLS model
+                quadratic_part = ' + '.join([f'I({f}**2)' for f in clean_features])
+                formula = f"{clean_target} ~ {main_and_interaction} + {quadratic_part}"
+
                 ols_model = ols(formula, data=formula_df).fit()
                 anova_table = sm.stats.anova_lm(ols_model, typ=2)
                 st.write("ANOVA Table:")
                 st.dataframe(anova_table.style.format('{:.4f}'))
 
-                # Interpret ANOVA results
                 alpha = 0.05
                 significant_factors = anova_table[anova_table['PR(>F)'] < alpha].index.tolist()
                 non_significant_factors = anova_table[anova_table['PR(>F)'] >= alpha].index.tolist()
@@ -531,8 +520,8 @@ def handle_doe_modeling():
                 st.plotly_chart(fig_rsm, use_container_width=True)
 
             elif len(features) == 2:
-                x1_range = np.linspace(X.iloc[:,0].min(), X.iloc[:,0].max(), 50)
-                x2_range = np.linspace(X.iloc[:,1].min(), X.iloc[:,1].max(), 50)
+                x1_range = np.linspace(X.iloc[:,0].min(), X.iloc[:,0].max(), 100)
+                x2_range = np.linspace(X.iloc[:,1].min(), X.iloc[:,1].max(), 100)
                 x1_grid, x2_grid = np.meshgrid(x1_range, x2_range)
                 grid_df = pd.DataFrame(np.c_[x1_grid.ravel(), x2_grid.ravel()], columns=features)
                 
@@ -546,7 +535,7 @@ def handle_doe_modeling():
                 fig_rsm.update_layout(title=f'Response Surface: {target_col}', scene=dict(xaxis_title=features[0], yaxis_title=features[1], zaxis_title=target_col))
                 st.plotly_chart(fig_rsm, use_container_width=True)
             else:
-                st.info("Response surface plots and ANOVA are only available for 1 or 2 features.")
+                st.info("Response surface plots are only available for 1 or 2 features. ANOVA and other analyses are still performed.")
 
             st.subheader("Feature Importance (SHAP)")
             try:
