@@ -644,7 +644,8 @@ def handle_bayesian_optimization():
                 if goal == 'Maximize':
                     mu = -mu
                 
-                y_best = result.fun
+                # Use the best observed value for EI calculation
+                y_best = np.min(result.func_vals)
                 
                 # Calculate Expected Improvement (EI)
                 with np.errstate(divide='warn'):
@@ -678,15 +679,27 @@ def handle_bayesian_optimization():
                         if not is_close:
                             suggestions.append({'point': point_to_add, 'strategy': 'Balanced (High EI)'})
                 
-                suggestion_df = pd.DataFrame([s['point'] for s in suggestions], columns=features)
+                # Create the final dataframe with predictions and confidence
+                suggestion_points = np.array([s['point'] for s in suggestions])
+                suggestion_mu, suggestion_std = gpr.predict(suggestion_points, return_std=True)
+
+                suggestion_df = pd.DataFrame(suggestion_points, columns=features)
                 suggestion_df['Suggestion Strategy'] = [s['strategy'] for s in suggestions]
+                suggestion_df['Expected Outcome'] = -suggestion_mu if goal == 'Maximize' else suggestion_mu
+                
+                max_std_overall = np.max(std)
+                suggestion_df['Confidence (%)'] = (1 - (suggestion_std / max_std_overall)) * 100 if max_std_overall > 0 else 100
+
                 st.session_state.batch_suggestions = suggestion_df
 
 
         # --- Display Batch Suggestions ---
         if 'batch_suggestions' in st.session_state and st.session_state.batch_suggestions is not None:
             st.subheader("2. Suggested Batch of Experiments")
-            st.dataframe(st.session_state.batch_suggestions)
+            df_to_display = st.session_state.batch_suggestions.copy()
+            df_to_display['Expected Outcome'] = df_to_display['Expected Outcome'].map('{:.4f}'.format)
+            df_to_display['Confidence (%)'] = df_to_display['Confidence (%)'].map('{:.1f}'.format)
+            st.dataframe(df_to_display)
         
         # --- Display Visualizations from the single optimization run ---
         if 'opt_result' in st.session_state and st.session_state.opt_result is not None:
