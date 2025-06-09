@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.pipeline import Pipeline
@@ -26,7 +27,7 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKern
 from skopt import gp_minimize
 from skopt.space import Real
 from skopt.utils import use_named_args
-from skopt.plots import plot_objective, plot_evaluations
+# NOTE: skopt.plots are no longer used to avoid errors.
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -517,16 +518,16 @@ def handle_doe_modeling():
                 st.error(f"Could not perform ANOVA: {e}")
 
             st.subheader("Response Surface Plot")
+            fig = None  # Initialize fig to None
             if len(features) == 1:
-                fig_rsm = go.Figure()
+                fig = go.Figure()
                 x_range = pd.DataFrame(np.linspace(X.iloc[:,0].min(), X.iloc[:,0].max(), 100), columns=features)
                 x_range_processed = preprocessor.transform(x_range)
                 y_pred_rsm = best_model.predict(x_range_processed)
                 
-                fig_rsm.add_trace(go.Scatter(x=x_range.iloc[:,0], y=y_pred_rsm, mode='lines', name='Model Prediction'))
-                fig_rsm.add_trace(go.Scatter(x=X.iloc[:,0], y=y, mode='markers', name='Original Data', marker=dict(color='red')))
-                fig_rsm.update_layout(title=f'Response Surface: {target_col} vs {features[0]}', xaxis_title=features[0], yaxis_title=target_col)
-                st.plotly_chart(fig_rsm, use_container_width=True)
+                fig.add_trace(go.Scatter(x=x_range.iloc[:,0], y=y_pred_rsm, mode='lines', name='Model Prediction'))
+                fig.add_trace(go.Scatter(x=X.iloc[:,0], y=y, mode='markers', name='Original Data', marker=dict(color='red')))
+                fig.update_layout(title=f'Response Surface: {target_col} vs {features[0]}', xaxis_title=features[0], yaxis_title=target_col)
 
             elif len(features) == 2:
                 x1_range = np.linspace(X.iloc[:,0].min(), X.iloc[:,0].max(), 100)
@@ -537,14 +538,17 @@ def handle_doe_modeling():
                 grid_processed = preprocessor.transform(grid_df)
                 y_pred_grid = best_model.predict(grid_processed).reshape(x1_grid.shape)
                 
-                fig_rsm = go.Figure(data=[
+                fig = go.Figure(data=[
                     go.Surface(z=y_pred_grid, x=x1_grid, y=x2_grid, colorscale='Viridis', opacity=0.7, name='Predicted Surface'),
                     go.Scatter3d(x=X.iloc[:,0], y=X.iloc[:,1], z=y, mode='markers', name='Original Data', marker=dict(color='red', size=5))
                 ])
-                fig_rsm.update_layout(title=f'Response Surface: {target_col}', scene=dict(xaxis_title=features[0], yaxis_title=features[1], zaxis_title=target_col))
-                st.plotly_chart(fig_rsm, use_container_width=True)
+                fig.update_layout(title=f'Response Surface: {target_col}', scene=dict(xaxis_title=features[0], yaxis_title=features[1], zaxis_title=target_col))
             else:
                 st.info("Response surface plots are only available for 1 or 2 features. ANOVA and other analyses are still performed.")
+            
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+
 
             st.subheader("Feature Importance (SHAP)")
             try:
@@ -629,6 +633,7 @@ def handle_bayesian_optimization():
         if 'opt_result' in st.session_state and st.session_state.opt_result is not None:
             result = st.session_state.opt_result
             features = st.session_state.features_for_opt
+            goal = st.session_state.get('opt_goal', 'Minimize') # Get goal from session state
             
             st.subheader("2. Optimization Results")
             opt_val = -result.fun if goal == "Maximize" else result.fun
@@ -658,6 +663,7 @@ def handle_bayesian_optimization():
                     opt_point[st.session_state.target_for_opt] = opt_val
 
                     if len(features) == 1:
+                        perf_df = pd.DataFrame({"Model": st.session_state.ml_results.keys(), "Full Fit R²": [r['full_fit_r2'] for r in st.session_state.ml_results.values()]}).set_index("Model")
                         fig = go.Figure()
                         # Plot response surface
                         x_range = pd.DataFrame(np.linspace(X_orig.iloc[:,0].min(), X_orig.iloc[:,0].max(), 100), columns=features)
@@ -667,12 +673,13 @@ def handle_bayesian_optimization():
                         
                         # Plot original, evaluated, and optimal points
                         fig.add_trace(go.Scatter(x=X_orig.iloc[:,0], y=y_orig, mode='markers', name='Original Data', marker=dict(color='grey')))
-                        fig.add_trace(go.Scatter(x=eval_points.iloc[:,0], y=eval_points.iloc[:,1], mode='markers', name='Evaluated Points', marker=dict(color='blue')))
-                        fig.add_trace(go.Scatter(x=opt_point.iloc[:,0], y=opt_point.iloc[:,1], mode='markers', name='Predicted Optimum', marker=dict(color='red', symbol='star', size=15)))
+                        fig.add_trace(go.Scatter(x=eval_points.iloc[:,0], y=eval_points[st.session_state.target_for_opt], mode='markers', name='Evaluated Points', marker=dict(color='blue')))
+                        fig.add_trace(go.Scatter(x=opt_point.iloc[:,0], y=opt_point[st.session_state.target_for_opt], mode='markers', name='Predicted Optimum', marker=dict(color='red', symbol='star', size=15)))
                         fig.update_layout(title="Optimization Path", xaxis_title=features[0], yaxis_title=st.session_state.target_for_opt)
                         st.plotly_chart(fig, use_container_width=True)
 
                     elif len(features) == 2:
+                        perf_df = pd.DataFrame({"Model": st.session_state.ml_results.keys(), "Full Fit R²": [r['full_fit_r2'] for r in st.session_state.ml_results.values()]}).set_index("Model")
                         fig = go.Figure()
                         # Plot response surface
                         x1_range = np.linspace(X_orig.iloc[:,0].min(), X_orig.iloc[:,0].max(), 100)
@@ -685,23 +692,105 @@ def handle_bayesian_optimization():
                         
                         # Plot points
                         fig.add_trace(go.Scatter3d(x=X_orig.iloc[:,0], y=X_orig.iloc[:,1], z=y_orig, mode='markers', name='Original Data', marker=dict(color='grey')))
-                        fig.add_trace(go.Scatter3d(x=eval_points.iloc[:,0], y=eval_points.iloc[:,1], z=eval_points.iloc[:,2], mode='markers', name='Evaluated Points', marker=dict(color='blue')))
-                        fig.add_trace(go.Scatter3d(x=opt_point.iloc[:,0], y=opt_point.iloc[:,1], z=opt_point.iloc[:,2], mode='markers', name='Predicted Optimum', marker=dict(color='red', symbol='diamond', size=8)))
+                        fig.add_trace(go.Scatter3d(x=eval_points.iloc[:,0], y=eval_points.iloc[:,1], z=eval_points[st.session_state.target_for_opt], mode='markers', name='Evaluated Points', marker=dict(color='blue')))
+                        fig.add_trace(go.Scatter3d(x=opt_point.iloc[:,0], y=opt_point.iloc[:,1], z=opt_point[st.session_state.target_for_opt], mode='markers', name='Predicted Optimum', marker=dict(color='red', symbol='diamond', size=8)))
                         fig.update_layout(title="Optimization Path", scene=dict(xaxis_title=features[0], yaxis_title=features[1], zaxis_title=st.session_state.target_for_opt))
                         st.plotly_chart(fig, use_container_width=True)
 
-            # --- Skopt diagnostic plots ---
-            with st.expander("Show skopt diagnostic plots"):
+            # --- Custom Diagnostic Plots (Rebuilt with Plotly) ---
+            with st.expander("Show Diagnostic Plots"):
                 try:
-                    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-                    plot_objective(result, ax=ax, dimensions=features)
-                    st.pyplot(fig)
+                    with st.spinner("Generating diagnostic plots..."):
+                        gpr = result.models[-1]
+                        optimal_point = result.x
+                        n_features = len(features)
 
-                    fig2, ax2 = plt.subplots(1, 1, figsize=(8, 6))
-                    plot_evaluations(result, ax=ax2, dimensions=features)
-                    st.pyplot(fig2)
+                        if n_features == 2:
+                            st.write("#### Objective and Partial Dependence Plots")
+                            
+                            # Create a gridspec for layout
+                            fig = make_subplots(
+                                rows=4, cols=4,
+                                specs=[[{"colspan": 3}, None, None, None],
+                                       [{"rowspan": 3, "colspan": 3}, None, None, {"rowspan": 3}],
+                                       [None, None, None, None],
+                                       [None, None, None, None]],
+                                vertical_spacing=0.05, horizontal_spacing=0.05
+                            )
+
+                            # Main contour plot data
+                            x1_range = np.linspace(result.space.dimensions[0].low, result.space.dimensions[0].high, 40)
+                            x2_range = np.linspace(result.space.dimensions[1].low, result.space.dimensions[1].high, 40)
+                            x1_grid, x2_grid = np.meshgrid(x1_range, x2_range)
+                            eval_points_contour = np.c_[x1_grid.ravel(), x2_grid.ravel()]
+                            predictions = gpr.predict(eval_points_contour).reshape(x1_grid.shape)
+                            if goal == "Maximize": predictions = -predictions
+                            x_iters = np.array(result.x_iters)
+
+                            # Main contour plot traces
+                            fig.add_trace(go.Contour(z=predictions, x=x1_range, y=x2_range, colorscale='Viridis', showscale=False), row=2, col=1)
+                            fig.add_trace(go.Scatter(x=x_iters[:, 0], y=x_iters[:, 1], mode='markers', marker=dict(color='rgba(128,128,128,0.7)'), name='Evaluated'), row=2, col=1)
+                            fig.add_trace(go.Scatter(x=[optimal_point[0]], y=[optimal_point[1]], mode='markers', marker=dict(color='red', symbol='star', size=15), name='Optimum'), row=2, col=1)
+
+                            # Partial dependence on top axis
+                            feature_range_top = np.linspace(result.space.dimensions[0].low, result.space.dimensions[0].high, 100)
+                            eval_points_top = np.tile(optimal_point, (100, 1))
+                            eval_points_top[:, 0] = feature_range_top
+                            preds_top, std_top = gpr.predict(eval_points_top, return_std=True)
+                            if goal == "Maximize": preds_top = -preds_top
+                            fig.add_trace(go.Scatter(x=feature_range_top, y=preds_top, mode='lines', line=dict(color='blue')), row=1, col=1)
+                            fig.add_trace(go.Scatter(x=np.concatenate([feature_range_top, feature_range_top[::-1]]), y=np.concatenate([preds_top - std_top, (preds_top + std_top)[::-1]]), fill='toself', fillcolor='rgba(0,100,80,0.2)', line=dict(color='rgba(255,255,255,0)'), name='Confidence'), row=1, col=1)
+                            fig.add_vline(x=optimal_point[0], line_dash="dash", line_color="red", row=1, col=1)
+
+                            # Partial dependence on right axis
+                            feature_range_right = np.linspace(result.space.dimensions[1].low, result.space.dimensions[1].high, 100)
+                            eval_points_right = np.tile(optimal_point, (100, 1))
+                            eval_points_right[:, 1] = feature_range_right
+                            preds_right, std_right = gpr.predict(eval_points_right, return_std=True)
+                            if goal == "Maximize": preds_right = -preds_right
+                            fig.add_trace(go.Scatter(y=feature_range_right, x=preds_right, mode='lines', line=dict(color='blue')), row=2, col=4)
+                            fig.add_trace(go.Scatter(y=np.concatenate([feature_range_right, feature_range_right[::-1]]), x=np.concatenate([preds_right - std_right, (preds_right + std_right)[::-1]]), fill='toself', fillcolor='rgba(0,100,80,0.2)', line=dict(color='rgba(255,255,255,0)')), row=2, col=4)
+                            fig.add_hline(y=optimal_point[1], line_dash="dash", line_color="red", row=2, col=4)
+                            
+                            fig.update_layout(height=600, width=600, title_text="Objective and Partial Dependence", showlegend=False)
+                            fig.update_xaxes(title_text=features[0], row=2, col=1)
+                            fig.update_yaxes(title_text=features[1], row=2, col=1)
+                            fig.update_yaxes(title_text="Partial Dep.", showticklabels=False, row=1, col=1)
+                            fig.update_xaxes(title_text="Partial Dep.", showticklabels=False, row=2, col=4)
+                            st.plotly_chart(fig, use_container_width=True)
+
+                        else: # Fallback for 1 or >2 features
+                            st.write("#### Partial Dependence Plots")
+                            n_cols = min(n_features, 2)
+                            n_rows = (n_features + n_cols - 1) // n_cols
+                            fig = make_subplots(rows=n_rows, cols=n_cols, subplot_titles=features)
+                            for i, feature in enumerate(features):
+                                row = i // n_cols + 1
+                                col = i % n_cols + 1
+                                feature_range = np.linspace(result.space.dimensions[i].low, result.space.dimensions[i].high, 100)
+                                eval_points_pd = np.tile(optimal_point, (100, 1))
+                                eval_points_pd[:, i] = feature_range
+                                predictions, std = gpr.predict(eval_points_pd, return_std=True)
+                                if goal == "Maximize": predictions = -predictions
+                                
+                                fig.add_trace(go.Scatter(x=feature_range, y=predictions, mode='lines', line_color='blue'), row=row, col=col)
+                                fig.add_trace(go.Scatter(x=np.concatenate([feature_range, feature_range[::-1]]), y=np.concatenate([predictions - 1.96 * std, (predictions + 1.96 * std)[::-1]]), fill='toself', fillcolor='rgba(0,100,80,0.2)', line=dict(color='rgba(255,255,255,0)')), row=row, col=col)
+                                fig.add_vline(x=optimal_point[i], line_dash="dash", line_color="red", row=row, col=col)
+                            fig.update_layout(height=300 * n_rows, title_text="Partial Dependence Plots", showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True)
+
+                        # Always show Convergence plot
+                        st.write("#### Convergence Trace")
+                        objective_values = np.array(result.func_vals)
+                        if goal == "Maximize": objective_values = -objective_values
+                        best_seen = np.minimum.accumulate(objective_values) if goal == "Minimize" else np.maximum.accumulate(objective_values)
+                        fig_conv = go.Figure()
+                        fig_conv.add_trace(go.Scatter(x=list(range(1, len(best_seen) + 1)), y=best_seen, mode='lines+markers', line=dict(color='green')))
+                        fig_conv.update_layout(title="Convergence Trace", xaxis_title="Iteration", yaxis_title=f"Best Seen {st.session_state.target_for_opt}", height=400)
+                        st.plotly_chart(fig_conv, use_container_width=True)
+
                 except Exception as e:
-                    st.warning(f"Could not generate skopt plots: {e}")
+                    st.warning(f"Could not generate diagnostic plots: {e}")
 
 def handle_reporting():
     """Handles the generation of a downloadable Excel report."""
@@ -718,9 +807,14 @@ def handle_reporting():
             }
             if st.session_state.get('opt_result'):
                 res = st.session_state.get('opt_result')
+                goal = st.session_state.get('opt_goal', 'Minimize') # Get goal, default to Minimize
                 opt_df = pd.DataFrame(res.x_iters, columns=st.session_state.features_for_opt)
-                opt_df['target_value'] = res.func_vals
-                dfs_to_download["Optimization_Suggestions"] = opt_df.sort_values('target_value').reset_index(drop=True)
+                
+                target_values = -np.array(res.func_vals) if goal == "Maximize" else np.array(res.func_vals)
+                opt_df['predicted_target_value'] = target_values
+                
+                sort_ascending = goal == "Minimize"
+                dfs_to_download["Optimization_Suggestions"] = opt_df.sort_values('predicted_target_value', ascending=sort_ascending).reset_index(drop=True)
 
             st.markdown(get_excel_download_link(dfs_to_download, "LFA_Analysis_Report.xlsx"), unsafe_allow_html=True)
 
