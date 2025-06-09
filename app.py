@@ -90,7 +90,7 @@ def main():
             'y_scaler', 'x_preprocessor', 'target_col', 'performance_metrics',
             'X_train', 'y_train', 'final_doe_df', 'df_tidy_merged', 'df_5pl_results_merged',
             'ml_results', 'opt_result', 'modeling_df_for_opt', 'features_for_opt', 'target_for_opt',
-            'batch_suggestions'
+            'batch_suggestions', 'global_optimum'
         ]
         for key in keys_to_init:
             if key not in st.session_state:
@@ -476,45 +476,55 @@ def handle_doe_modeling():
 
             st.subheader("ANOVA Analysis for Quadratic Model")
             try:
-                formula_df = df_for_modeling[[target_col] + features].dropna().drop_duplicates()
-                clean_target = ''.join(c if c.isalnum() else '_' for c in target_col)
-                clean_features = [''.join(c if c.isalnum() else '_' for c in f) for f in features]
-                formula_df.columns = [clean_target] + clean_features
+                # FIX: More robust data cleaning for ANOVA
+                formula_df = df_for_modeling[[target_col] + features].copy()
+                formula_df = formula_df.apply(pd.to_numeric, errors='coerce')
+                formula_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+                formula_df.dropna(inplace=True)
+                formula_df = formula_df.astype(float)
+                formula_df.drop_duplicates(inplace=True)
 
-                if len(clean_features) > 1:
-                    main_and_interaction = f"({' + '.join(clean_features)})**2"
+                if formula_df.empty:
+                    st.warning("No data left for ANOVA after cleaning infinite values and NaNs.")
                 else:
-                    main_and_interaction = ' + '.join(clean_features)
-                
-                quadratic_part = ' + '.join([f'I({f}**2)' for f in clean_features])
-                formula = f"{clean_target} ~ {main_and_interaction} + {quadratic_part}"
+                    clean_target = ''.join(c if c.isalnum() else '_' for c in target_col)
+                    clean_features = [''.join(c if c.isalnum() else '_' for c in f) for f in features]
+                    formula_df.columns = [clean_target] + clean_features
 
-                ols_model = ols(formula, data=formula_df).fit()
-                anova_table = sm.stats.anova_lm(ols_model, typ=2)
-                st.write("ANOVA Table:")
-                st.dataframe(anova_table.style.format('{:.4f}'))
+                    if len(clean_features) > 1:
+                        main_and_interaction = f"({' + '.join(clean_features)})**2"
+                    else:
+                        main_and_interaction = ' + '.join(clean_features)
+                    
+                    quadratic_part = ' + '.join([f'I({f}**2)' for f in clean_features])
+                    formula = f"{clean_target} ~ {main_and_interaction} + {quadratic_part}"
 
-                alpha = 0.05
-                significant_factors = anova_table[anova_table['PR(>F)'] < alpha].index.tolist()
-                non_significant_factors = anova_table[anova_table['PR(>F)'] >= alpha].index.tolist()
-                
-                st.subheader("ANOVA Interpretation")
-                st.markdown(f"""
-                Analysis of Variance (ANOVA) helps us understand which factors significantly affect the response variable, **{target_col}**. We test this by looking at the p-value (`PR(>F)`). The p-value tells us the probability of observing our results if the factor actually has no effect.
-                A common threshold for significance (alpha, α) is **{alpha}**.
-                - If **p-value < {alpha}**, we conclude the factor has a statistically significant effect.
-                - If **p-value ≥ {alpha}**, we conclude there isn't enough evidence to say the factor has an effect.
-                """)
+                    ols_model = ols(formula, data=formula_df).fit()
+                    anova_table = sm.stats.anova_lm(ols_model, typ=2)
+                    st.write("ANOVA Table:")
+                    st.dataframe(anova_table.style.format('{:.4f}'))
 
-                if significant_factors:
-                    st.success(f"**Significant Factors (p < {alpha}):** " + ", ".join(significant_factors))
-                else:
-                    st.info(f"**Significant Factors (p < {alpha}):** None")
+                    alpha = 0.05
+                    significant_factors = anova_table[anova_table['PR(>F)'] < alpha].index.tolist()
+                    non_significant_factors = anova_table[anova_table['PR(>F)'] >= alpha].index.tolist()
+                    
+                    st.subheader("ANOVA Interpretation")
+                    st.markdown(f"""
+                    Analysis of Variance (ANOVA) helps us understand which factors significantly affect the response variable, **{target_col}**. We test this by looking at the p-value (`PR(>F)`). The p-value tells us the probability of observing our results if the factor actually has no effect.
+                    A common threshold for significance (alpha, α) is **{alpha}**.
+                    - If **p-value < {alpha}**, we conclude the factor has a statistically significant effect.
+                    - If **p-value ≥ {alpha}**, we conclude there isn't enough evidence to say the factor has an effect.
+                    """)
 
-                if non_significant_factors:
-                    st.warning(f"**Non-Significant Factors (p ≥ {alpha}):** " + ", ".join(non_significant_factors))
-                else:
-                    st.info(f"**Non-Significant Factors (p ≥ {alpha}):** None")
+                    if significant_factors:
+                        st.success(f"**Significant Factors (p < {alpha}):** " + ", ".join(significant_factors))
+                    else:
+                        st.info(f"**Significant Factors (p < {alpha}):** None")
+
+                    if non_significant_factors:
+                        st.warning(f"**Non-Significant Factors (p ≥ {alpha}):** " + ", ".join(non_significant_factors))
+                    else:
+                        st.info(f"**Non-Significant Factors (p ≥ {alpha}):** None")
 
             except Exception as e:
                 st.error(f"Could not perform ANOVA: {e}")
@@ -631,69 +641,105 @@ def handle_bayesian_optimization():
                     return -prediction if goal == "Maximize" else prediction
                 
                 # We run gp_minimize to get a trained GPR model (the surrogate)
-                result = gp_minimize(func=objective, dimensions=search_space, n_calls=20, random_state=42, acq_func="EI")
+                result = gp_minimize(
+                    func=objective,
+                    dimensions=search_space,
+                    n_calls=25,
+                    n_initial_points=15,
+                    acq_func="LCB",
+                    acq_optimizer="sampling",
+                    random_state=42
+                )
                 st.session_state.opt_result = result
                 
                 # Now, use the trained GPR to generate batch suggestions
                 gpr = result.models[-1]
                 
-                # Generate a large sample of points to evaluate
-                grid_points = result.space.rvs(n_samples=1000, random_state=42)
-                mu, std = gpr.predict(grid_points, return_std=True)
+                # --- NEW: Find Global Optimum of the Surrogate ---
+                def surrogate_objective(x):
+                    return gpr.predict(np.array(x).reshape(1, -1))[0]
                 
-                if goal == 'Maximize':
-                    mu = -mu
+                bounds = [(dim.low, dim.high) for dim in result.space.dimensions]
                 
-                # Use the best observed value for EI calculation
-                y_best = np.min(result.func_vals)
+                # Find the global minimum of the surrogate
+                global_min_result = minimize(surrogate_objective, result.x, bounds=bounds, method='L-BFGS-B')
+                global_optimum_point = global_min_result.x
                 
-                # Calculate Expected Improvement (EI)
-                with np.errstate(divide='warn'):
-                    imp = y_best - mu
-                    Z = imp / std
-                    ei = imp * norm.cdf(Z) + std * norm.pdf(Z)
-                    ei[std == 0.0] = 0.0
+                # Predict this point with the original best model
+                global_optimum_point_df = pd.DataFrame([global_optimum_point], columns=features)
+                global_optimum_point_processed = preprocessor.transform(global_optimum_point_df)
+                global_optimum_prediction = best_model.predict(global_optimum_point_processed)[0]
 
+                st.session_state.global_optimum = {
+                    "point": global_optimum_point,
+                    "prediction": global_optimum_prediction
+                }
+
+                # --- Generate Batch Suggestions ---
                 suggestions = []
-                # Suggestion 1: Best predicted
-                best_idx = np.argmin(mu)
-                suggestions.append({'point': grid_points[best_idx], 'strategy': 'Exploitation (Best Predicted)'})
+                suggestions.append({
+                    'point': global_optimum_point,
+                    'strategy': 'Exploitation (Best Predicted Optimum)'
+                })
 
-                # Suggestion 2: Highest Uncertainty
                 if batch_size > 1:
-                    uncertainty_idx = np.argmax(std)
-                    suggestions.append({'point': grid_points[uncertainty_idx], 'strategy': 'Exploration (Highest Uncertainty)'})
+                    grid_points = np.array(result.space.rvs(n_samples=1000, random_state=42))
+                    mu, std = gpr.predict(grid_points, return_std=True)
+                    y_best = result.fun 
+                    
+                    with np.errstate(divide='warn', invalid='ignore'):
+                        imp = y_best - mu
+                        Z = imp / std
+                        ei = imp * norm.cdf(Z) + std * norm.pdf(Z)
+                        ei[std == 0.0] = 0.0
 
-                # Subsequent suggestions from EI
-                if batch_size > 2:
-                    ei_sorted_indices = np.argsort(ei)[::-1]
-                    for idx in ei_sorted_indices:
-                        if len(suggestions) >= batch_size: break
-                        point_to_add = grid_points[idx]
-                        # Check if it's too close to existing suggestions
-                        is_close = False
-                        for sug in suggestions:
-                            if np.allclose(sug['point'], point_to_add, atol=0.01):
-                                is_close = True
-                                break
-                        if not is_close:
-                            suggestions.append({'point': point_to_add, 'strategy': 'Balanced (High EI)'})
+                    # Filter points close to the global optimum
+                    dist_to_best = np.sqrt(np.sum((grid_points - global_optimum_point)**2, axis=1))
+                    mask = dist_to_best > 0.01
+                    
+                    std_rem = std[mask]
+                    ei_rem = ei[mask]
+                    remaining_points = grid_points[mask]
+
+                    if len(remaining_points) > 0:
+                        uncertainty_idx = np.argmax(std_rem)
+                        suggestions.append({'point': remaining_points[uncertainty_idx], 'strategy': 'Exploration (Highest Uncertainty)'})
+
+                    if batch_size > 2 and len(remaining_points) > 1:
+                        current_suggestions_pts = np.array([s['point'] for s in suggestions])
+                        ei_sorted_indices = np.argsort(ei_rem)[::-1]
+                        for idx in ei_sorted_indices:
+                            if len(suggestions) >= batch_size: break
+                            point_to_add = remaining_points[idx]
+                            
+                            is_close = False
+                            for sug_pt in current_suggestions_pts:
+                                if np.allclose(sug_pt, point_to_add, atol=0.01):
+                                    is_close = True
+                                    break
+                            if not is_close:
+                                suggestions.append({'point': point_to_add, 'strategy': 'Balanced (High EI)'})
                 
-                # Create the final dataframe with predictions and confidence
+                # Finalize suggestion dataframe
                 suggestion_points = np.array([s['point'] for s in suggestions])
-                suggestion_mu, suggestion_std = gpr.predict(suggestion_points, return_std=True)
-
                 suggestion_df = pd.DataFrame(suggestion_points, columns=features)
                 suggestion_df['Suggestion Strategy'] = [s['strategy'] for s in suggestions]
-                suggestion_df['Expected Outcome'] = -suggestion_mu if goal == 'Maximize' else suggestion_mu
                 
-                max_std_overall = np.max(std)
+                suggestion_points_processed = preprocessor.transform(suggestion_df[features])
+                true_model_preds = best_model.predict(suggestion_points_processed)
+                suggestion_df['Expected Outcome'] = true_model_preds
+                
+                _, suggestion_std = gpr.predict(suggestion_points, return_std=True)
+                max_std_overall = np.max(std) if len(std) > 0 else 0
                 suggestion_df['Confidence (%)'] = (1 - (suggestion_std / max_std_overall)) * 100 if max_std_overall > 0 else 100
 
                 st.session_state.batch_suggestions = suggestion_df
 
-
-        # --- Display Batch Suggestions ---
+        # --- Display KPI and Batch Suggestions ---
+        if 'global_optimum' in st.session_state and st.session_state.global_optimum is not None:
+             st.subheader(f"Global Optimum Found")
+             st.metric(f"Best Predicted {st.session_state.target_for_opt}", f"{st.session_state.global_optimum['prediction']:.4f}")
+        
         if 'batch_suggestions' in st.session_state and st.session_state.batch_suggestions is not None:
             st.subheader("2. Suggested Batch of Experiments")
             df_to_display = st.session_state.batch_suggestions.copy()
@@ -712,7 +758,7 @@ def handle_bayesian_optimization():
                 try:
                     with st.spinner("Generating diagnostic plots..."):
                         gpr = result.models[-1]
-                        optimal_point = result.x
+                        optimal_point = st.session_state.global_optimum['point'] # Use the global optimum for plotting
                         n_features = len(features)
 
                         if n_features == 2:
