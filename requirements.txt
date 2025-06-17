@@ -9,4 +9,5 @@ scikit-optimize==0.9.0
 matplotlib==3.9.0
 fpdf2==2.7.8
 kaleido==0.2.1
+Jinja2==3.1.2
 
