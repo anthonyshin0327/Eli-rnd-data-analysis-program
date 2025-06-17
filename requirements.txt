@@ -10,4 +10,5 @@ statsmodels
 kaleido
 scikit-optimize
 fpdf2
+pycaret
 
