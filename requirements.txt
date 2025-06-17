@@ -1,14 +1,12 @@
-streamlit
-pandas
-numpy
-plotly
-scikit-learn
-scipy
-matplotlib
-shap
-statsmodels
-kaleido
-scikit-optimize
-fpdf2
-pycaret
+streamlit==1.35.0
+pandas==2.2.2
+numpy==1.26.4
+plotly==5.22.0
+pycaret[full]==3.3.2
+scipy==1.13.1
+scikit-optimize==0.10.2
+matplotlib==3.9.0
+fpdf2==2.7.8
+kaleido==0.2.1
+--find-links https://storage.googleapis.com/scikit-optimize/skopt-0.9.0-py2.py3-none-any.whl
 
