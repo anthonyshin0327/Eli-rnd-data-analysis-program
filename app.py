@@ -261,7 +261,7 @@ def main():
             'modeling_df_for_opt', 'features_for_opt', 'target_for_opt',
             'opt_result', 'batch_suggestions', 'global_optimum', 
             'dose_response_fig', 'opt_landscape_fig', 'opt_convergence_fig',
-            'model_comparison_df', 'rsm_fig_path'
+            'model_comparison_df', 'rsm_fig_path', 'perform_dr' # Added 'perform_dr' to session state
         ]
         for key in keys_to_init:
             if key not in st.session_state:
@@ -276,8 +276,9 @@ def main():
 
         if uploaded_file:
             # Clear state on new upload
+            # Preserve 'data_source' and 'perform_dr' to maintain user choices
             for key in keys_to_init:
-                if key == 'data_source':
+                if key in ['data_source', 'perform_dr']: 
                     continue
                 st.session_state[key] = None
             
@@ -290,6 +291,9 @@ def main():
 
                 if st.session_state.data_source == 'Custom':
                     st.session_state.df_tidy = st.session_state.df_raw.copy()
+                # Ensure df_tidy_merged is cleared/re-initialized on new upload
+                st.session_state.df_tidy_merged = None
+                st.session_state.df_5pl_results_merged = None
             except Exception as e:
                 st.error(f"Error reading file: {e}")
                 st.session_state.df_raw = None
@@ -390,16 +394,19 @@ def handle_dose_response_regression():
             st.info("Complete Step 1 to generate the Tidy Data required for this step.")
             return
 
-        perform_dr = st.toggle("Perform Dose-Response Regression?", value=True, key="perform_dr")
+        # Use a consistent key for toggles across app reruns
+        perform_dr = st.toggle("Perform Dose-Response Regression?", 
+                                value=st.session_state.get('perform_dr', True), # Default to True
+                                key="perform_dr")
         
+        # Store the current state of the toggle in session_state
+        st.session_state.perform_dr = perform_dr
+
         if not perform_dr:
-            # If DR is skipped, we still need to set df_5pl_results_merged for the modeling step
-            # For LUMOS, df_5pl_results_doe would typically be the tidy data
-            # For Custom, df_5pl_results (which is None here) is fine, and we'll use df_tidy directly.
-            # When DR is skipped, the "merged" data simply becomes the tidy data for both cases.
+            # If DR is skipped, the modeling step should use df_tidy directly
             st.session_state.df_tidy_merged = st.session_state.df_tidy.copy() 
-            st.session_state.df_5pl_results_merged = None # No DR results, so this should be None for modeling source
-            st.session_state.df_5pl_results = None # Explicitly set to None as no DR results
+            st.session_state.df_5pl_results_merged = None # Explicitly None if DR is skipped
+            st.session_state.df_5pl_results = None # Explicitly None if DR is skipped
             st.info("Skipping dose-response. The Tidy Data from Step 1 will be passed directly to the modeling step.")
             return
         
@@ -460,10 +467,17 @@ def handle_dose_response_regression():
                     param_names = ['a', 'b', 'c', 'd', 'g'] if model_choice == "5PL" else ['a', 'b', 'c', 'd']
                     results_df = pd.DataFrame(results, columns=['Group'] + param_names + ['R-squared'])
                     st.session_state.df_5pl_results = results_df
+                    # Also set the merged results here for the modeling step
+                    st.session_state.df_5pl_results_merged = results_df.copy()
+                    # Merged tidy data is just the tidy data if not combining with DoE factors later
+                    st.session_state.df_tidy_merged = st.session_state.df_tidy.copy()
                 else:
                     st.warning("Could not derive any dose-response models.")
                     st.session_state.df_5pl_results = None
-
+                    st.session_state.df_5pl_results_merged = None # Ensure it's None if no results
+                    st.session_state.df_tidy_merged = st.session_state.df_tidy.copy() # Still keep tidy data for other steps
+        
+        # Only show results if they exist in session state (after running DR or if already there from previous run)
         if st.session_state.get('df_5pl_results') is not None:
             results_df = st.session_state.df_5pl_results
             st.subheader("Checkpoint: Dose-Response Results")
@@ -482,21 +496,30 @@ def handle_dose_response_regression():
             fig = go.Figure()
             colors = px.colors.qualitative.Plotly
             df = st.session_state.df_tidy.copy()
-            for i, group in enumerate(sorted(df[group_by_col].unique())):
-                color = colors[i % len(colors)]
-                group_df_plot = df[df[group_by_col] == group]
-                fig.add_trace(go.Scatter(x=group_df_plot[conc_col], y=group_df_plot[y_var], mode='markers', name=f'Group {group} (data)', marker=dict(color=color)))
-                if not results_df[results_df['Group'] == group].empty:
-                    params = results_df[results_df['Group'] == group].iloc[0, 1:-1].values
-                    x_min = 0 
-                    x_max = group_df_plot[conc_col].max()
-                    x_range = np.linspace(x_min, x_max, 200)
-                    fit_func = five_pl if model_choice == "5PL" else four_pl
-                    y_pred = fit_func(x_range, *params)
-                    fig.add_trace(go.Scatter(x=x_range, y=y_pred, mode='lines', name=f'Group {group} (fit)', line=dict(color=color, dash='solid')))
-            fig.update_layout(xaxis_title=conc_col, yaxis_title=y_var, title="Dose-Response Analysis", legend_title_text='Group')
-            st.session_state.dose_response_fig = fig
-            st.plotly_chart(fig, use_container_width=True)
+            
+            # Ensure conc_col, group_by_col, and y_var are available before plotting
+            if 'dr_conc_col' in st.session_state and 'dr_group_col' in st.session_state and 'dr_y_var' in st.session_state:
+                conc_col_plot = st.session_state.dr_conc_col
+                group_by_col_plot = st.session_state.dr_group_col
+                y_var_plot = st.session_state.dr_y_var
+                
+                for i, group in enumerate(sorted(df[group_by_col_plot].unique())):
+                    color = colors[i % len(colors)]
+                    group_df_plot = df[df[group_by_col_plot] == group]
+                    fig.add_trace(go.Scatter(x=group_df_plot[conc_col_plot], y=group_df_plot[y_var_plot], mode='markers', name=f'Group {group} (data)', marker=dict(color=color)))
+                    if not results_df[results_df['Group'] == group].empty:
+                        params = results_df[results_df['Group'] == group].iloc[0, 1:-1].values
+                        x_min = 0 
+                        x_max = group_df_plot[conc_col_plot].max()
+                        x_range = np.linspace(x_min, x_max, 200)
+                        fit_func = five_pl if model_choice == "5PL" else four_pl
+                        y_pred = fit_func(x_range, *params)
+                        fig.add_trace(go.Scatter(x=x_range, y=y_pred, mode='lines', name=f'Group {group} (fit)', line=dict(color=color, dash='solid')))
+                fig.update_layout(xaxis_title=conc_col_plot, yaxis_title=y_var_plot, title="Dose-Response Analysis", legend_title_text='Group')
+                st.session_state.dose_response_fig = fig
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Select concentration, grouping, and response variables to display dose-response curves.")
 
 def handle_pycaret_modeling():
     """Handles DoE modeling using the PyCaret library."""
@@ -510,7 +533,7 @@ def handle_pycaret_modeling():
             st.info("Complete Step 1 to generate the data needed for this step.")
             return
 
-        feature_options = []
+        feature_options = [] # Initialize feature_options here
         if st.session_state.data_source == 'LUMOS':
             st.subheader("1. Define & Merge DoE Factors (LUMOS Data)")
             
@@ -521,14 +544,24 @@ def handle_pycaret_modeling():
                 st.write(f"Enter the DoE factor values for each unique group in **'{grouping_col}'**.")
                 
                 num_factors = st.number_input("Number of DoE Factors", min_value=1, value=1, key="pycaret_num_factors")
-                factor_names = [st.text_input(f"Factor {i+1} Name", f"DoE_Factor_{i+1}", key=f"pycaret_factor_name_{i}") for i in range(num_factors)]
+                # Persist factor_names in session_state
+                if 'factor_names' not in st.session_state or len(st.session_state.factor_names) != num_factors:
+                    st.session_state.factor_names = [f"DoE_Factor_{i+1}" for i in range(num_factors)]
+                
+                factor_names = [st.text_input(f"Factor {i+1} Name", st.session_state.factor_names[i], key=f"pycaret_factor_name_{i}") for i in range(num_factors)]
+                st.session_state.factor_names = factor_names # Update session state after user input
 
                 doe_input_df = unique_groups.copy()
                 for name in factor_names:
                     doe_input_df[name] = 0.0
                 
-                edited_doe_df = st.data_editor(doe_input_df, key="pycaret_doe_factor_editor", use_container_width=True)
+                # Retrieve and update edited_doe_df from session state
+                if 'edited_doe_df' not in st.session_state or not st.session_state.edited_doe_df.equals(doe_input_df):
+                    st.session_state.edited_doe_df = doe_input_df
                 
+                edited_doe_df = st.data_editor(st.session_state.edited_doe_df, key="pycaret_doe_factor_editor", use_container_width=True)
+                st.session_state.edited_doe_df = edited_doe_df # Store edited state back
+
                 df_tidy_merged = pd.merge(base_df_tidy, edited_doe_df, on=grouping_col, how='left')
                 st.session_state.df_tidy_merged = df_tidy_merged
                 
@@ -578,22 +611,35 @@ def handle_pycaret_modeling():
         if len(modeling_source_options) == 1:
             modeling_source = modeling_source_options[0]
             st.markdown(f"**Selected data source for modeling:** `{modeling_source}`")
+            # Ensure the radio button's value is also set for consistency if it was an actual radio button before
+            if 'pycaret_source_radio' in st.session_state:
+                del st.session_state['pycaret_source_radio'] # Remove the key if it exists to avoid conflicts
+            # Directly assign to a new session state key if needed by PyCaret setup later
+            st.session_state.current_modeling_source = modeling_source 
         else:
+            # If multiple options, use the radio button and set its default
+            default_source_index = 0
+            if 'current_modeling_source' in st.session_state and st.session_state.current_modeling_source in modeling_source_options:
+                default_source_index = modeling_source_options.index(st.session_state.current_modeling_source)
+
             modeling_source = st.radio(
                 "Select data source for modeling:",
                 options=modeling_source_options,
                 horizontal=True,
+                index=default_source_index,
                 key="pycaret_source_radio"
             )
+            st.session_state.current_modeling_source = modeling_source # Store selected source
 
         df_for_modeling = None
-        if modeling_source == "Raw/Tidy Data":
+        # Retrieve df_for_modeling based on the current_modeling_source
+        if st.session_state.current_modeling_source == "Raw/Tidy Data":
             df_for_modeling = st.session_state.get('df_tidy_merged')
         else: # "Dose-Response Parameters"
             df_for_modeling = st.session_state.get('df_5pl_results_merged')
 
         if df_for_modeling is None or df_for_modeling.empty:
-            st.error(f"Selected modeling data source ('{modeling_source}') is not available or is empty. Please ensure data is processed correctly and contains sufficient rows.")
+            st.error(f"Selected modeling data source ('{st.session_state.current_modeling_source}') is not available or is empty. Please ensure data is processed correctly and contains sufficient rows.")
             return
 
         all_numeric_cols = df_for_modeling.select_dtypes(include=np.number).columns.tolist()
@@ -609,16 +655,42 @@ def handle_pycaret_modeling():
                 feature_options = [col for col in all_numeric_cols if col not in ['T', 'C', 'T_norm', 'C_norm', 'T-C', 'C/T', 'T/C', 'T+C']]
         else: # Dose-Response Parameters
             # For DR Parameters, all numeric columns (except R-squared and DR parameters a,b,c,d,g if they are not features) are potential features
-            dr_param_cols = ['a', 'b', 'c', 'd', 'g', 'R-squared'] # R-squared is often a target, not a feature
-            feature_options = [col for col in all_numeric_cols if col not in dr_param_cols]
+            dr_param_cols = ['a', 'b', 'c', 'd', 'g'] # DR parameters are usually not features themselves
+            feature_options = [col for col in all_numeric_cols if col not in dr_param_cols and col != 'R-squared'] # R-squared is often a target
+        
+        # Filter feature options to only include those present in the actual dataframe
+        feature_options = [f for f in feature_options if f in df_for_modeling.columns]
 
+        # Ensure that selected target is a valid numeric column
+        if 'pycaret_target_selector' in st.session_state and st.session_state.pycaret_target_selector in all_numeric_cols:
+            default_target_index = all_numeric_cols.index(st.session_state.pycaret_target_selector)
+        elif len(all_numeric_cols) > 0:
+            default_target_index = 0 # Default to first numeric column
+        else:
+            default_target_index = None # No numeric columns available
 
-        target_col = st.selectbox("Select Target (Y):", all_numeric_cols, key="pycaret_target_selector")
+        target_col = st.selectbox(
+            "Select Target (Y):", 
+            options=all_numeric_cols, 
+            index=default_target_index, 
+            key="pycaret_target_selector"
+        )
         
         # Ensure target is not in feature options
         current_feature_options_filtered = [f for f in feature_options if f != target_col]
         
-        features = st.multiselect("Select Features (X):", current_feature_options_filtered, default=current_feature_options_filtered, key="pycaret_features_selector")
+        # Preserve selected features if they are still valid options
+        default_features = st.session_state.get('pycaret_features_selector', current_feature_options_filtered)
+        default_features = [f for f in default_features if f in current_feature_options_filtered]
+        if not default_features and current_feature_options_filtered: # If no default features but options exist
+            default_features = current_feature_options_filtered
+
+        features = st.multiselect(
+            "Select Features (X):", 
+            current_feature_options_filtered, 
+            default=default_features, 
+            key="pycaret_features_selector"
+        )
         
         st.session_state.modeling_df_for_opt = df_for_modeling
         st.session_state.features_for_opt = features
@@ -634,7 +706,7 @@ def handle_pycaret_modeling():
         with col_prep1:
             normalize = st.checkbox(
                 "Normalize Data", 
-                value=True, 
+                value=st.session_state.get('pycaret_normalize', True), # Default True
                 key="pycaret_normalize",
                 help="Scales numerical features to a standard range (e.g., between 0 and 1, or mean 0 and std 1). This helps algorithms sensitive to feature magnitudes perform better."
             )
@@ -642,7 +714,7 @@ def handle_pycaret_modeling():
                 normalize_method = st.selectbox(
                     "Normalization Method:",
                     options=['zscore', 'minmax', 'maxabs', 'robust'],
-                    index=0, # Default to zscore
+                    index=st.session_state.get('pycaret_normalize_method_idx', 0), # Default to zscore (index 0)
                     key="pycaret_normalize_method",
                     help="""
                     - **zscore**: Transforms data to have a mean of 0 and standard deviation of 1. Good for general use.
@@ -651,12 +723,14 @@ def handle_pycaret_modeling():
                     - **robust**: Scales data using statistics that are robust to outliers (median and interquartile range), useful if your data has many outliers.
                     """
                 )
+                st.session_state.pycaret_normalize_method_idx = ['zscore', 'minmax', 'maxabs', 'robust'].index(normalize_method)
             else:
                 normalize_method = None
+                if 'pycaret_normalize_method_idx' in st.session_state: del st.session_state['pycaret_normalize_method_idx']
             
             remove_outliers = st.checkbox(
                 "Remove Outliers (Isolation Forest)", 
-                value=False, # Default to False, as outlier removal can be risky
+                value=st.session_state.get('pycaret_remove_outliers', False), # Default False
                 key="pycaret_remove_outliers",
                 help="Identifies and removes data points that are significantly different from other observations using the Isolation Forest algorithm. Outliers can negatively impact model training, but removing them might discard valuable information."
             )
@@ -664,47 +738,50 @@ def handle_pycaret_modeling():
         with col_prep2:
             transformation = st.checkbox(
                 "Apply Power Transformation (Numerical)", 
-                value=False, # Default to False
+                value=st.session_state.get('pycaret_transformation', False), # Default False
                 key="pycaret_transformation",
                 help="Applies a power transformation (e.g., Box-Cox or Yeo-Johnson) to make numerical features more Gaussian-like (bell-shaped distribution). This can improve model performance, especially for linear models and neural networks."
             )
             
             remove_multicollinearity = st.checkbox(
                 "Remove Multicollinearity", 
-                value=False, # Default to False, can be useful but also removes features
+                value=st.session_state.get('pycaret_remove_multicollinearity', False), # Default False
                 key="pycaret_remove_multicollinearity",
                 help="Removes highly correlated (linearly dependent) features. Multicollinearity can make models unstable, difficult to interpret, and lead to overfitting."
             )
             if remove_multicollinearity:
                 multicollinearity_threshold = st.slider(
                     "Multicollinearity Threshold (correlation)",
-                    min_value=0.5, max_value=1.0, value=0.9, step=0.05,
+                    min_value=0.5, max_value=1.0, value=st.session_state.get('pycaret_multicollinearity_threshold', 0.9), step=0.05,
                     key="pycaret_multicollinearity_threshold",
                     help="The maximum allowed absolute correlation between features. Features with a correlation above this threshold will be considered for removal to reduce multicollinearity."
                 )
             else:
                 multicollinearity_threshold = None
+                if 'pycaret_multicollinearity_threshold' in st.session_state: del st.session_state['pycaret_multicollinearity_threshold']
+
 
         with col_prep3:
             feature_interaction = st.checkbox(
                 "Create Feature Interaction (Polynomial)", 
-                value=False, # Default to False, as it increases complexity
+                value=st.session_state.get('pycaret_feature_interaction', False), # Default False
                 key="pycaret_feature_interaction",
                 help="Generates new features by multiplying existing numerical features (e.g., creating a 'length * width' feature). This allows the model to capture more complex non-linear relationships, but increases dimensionality."
             )
             if feature_interaction:
                 polynomial_degree = st.number_input(
                     "Polynomial Degree:", 
-                    min_value=2, max_value=3, value=2, 
+                    min_value=2, max_value=3, value=st.session_state.get('pycaret_polynomial_degree', 2), 
                     key="pycaret_polynomial_degree",
                     help="The maximum power to which features will be raised and combined. A degree of 2 includes terms like $X_1^2$, $X_2^2$, $X_1X_2$. Higher degrees create more complex interactions."
                 )
             else:
                 polynomial_degree = None
+                if 'pycaret_polynomial_degree' in st.session_state: del st.session_state['pycaret_polynomial_degree']
             
             feature_selection = st.checkbox(
                 "Perform Feature Selection", 
-                value=False, # Default to False, can be computationally intensive or remove useful features
+                value=st.session_state.get('pycaret_feature_selection', False), # Default False
                 key="pycaret_feature_selection",
                 help="Automatically selects the most relevant features to improve model performance and reduce complexity. This can help prevent overfitting, especially with high-dimensional data, and speed up training."
             )
@@ -731,9 +808,9 @@ def handle_pycaret_modeling():
                                 remove_outliers=remove_outliers,
                                 remove_multicollinearity=remove_multicollinearity,
                                 multicollinearity_threshold=multicollinearity_threshold,
-                                feature_interaction=feature_interaction,
-                                polynomial_features=feature_interaction, # PyCaret uses polynomial_features for interaction terms
-                                polynomial_degree=polynomial_degree,
+                                feature_interaction=feature_interaction, # Corrected: passed as boolean
+                                # Removed polynomial_features argument as it's redundant when feature_interaction is used
+                                polynomial_degree=polynomial_degree, # Corrected: passed as numerical
                                 feature_selection=feature_selection,
                                 # Common imputation strategies
                                 numeric_imputation='mean', 
