@@ -1,13 +1,11 @@
-streamlit==1.35.0
-pandas==2.1.4
-numpy==1.26.4
-plotly==5.22.0
-pycaret==3.3.0
-scipy==1.13.1
-scikit-learn==1.4.2
-scikit-optimize==0.9.0
-matplotlib==3.9.0
-fpdf2==2.7.8
-kaleido==0.2.1
-Jinja2==3.1.2
-
+streamlit
+pandas
+numpy
+plotly
+pycaret
+scipy
+fpdf
+scikit-learn # For r2_score
+scikit-optimize # For skopt (Bayesian Optimization)
+openpyxl # For Excel export
+kaleido # If you want static Plotly image export

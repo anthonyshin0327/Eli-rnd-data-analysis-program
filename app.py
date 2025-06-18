@@ -31,6 +31,10 @@ from skopt import gp_minimize
 from skopt.space import Real
 from skopt.utils import use_named_args
 
+# --- !!! ADDED FOR TROUBLESHOOTING !!! ---
+from sklearn.metrics import r2_score 
+# --- !!! END ADDITION !!! ---
+
 # --- Page Configuration ---
 st.set_page_config(
     page_title="LFA Analysis & ML Suite",
@@ -789,13 +793,65 @@ def handle_bayesian_optimization():
 
                         # Logic for 2D and >2D plots remains the same, using the GPR surrogate
                         if n_features == 2:
-                             st.write("#### Objective and Partial Dependence Plots")
-                             # ... [Plotting code as in previous version, using 'gpr' and 'optimal_point']
-                             # This code is verbose, so keeping it the same as the previous correct implementation
-                        else:
+                             # Create a meshgrid for surface plotting
+                            x_values = np.linspace(result.space.dimensions[0].low, result.space.dimensions[0].high, 50)
+                            y_values = np.linspace(result.space.dimensions[1].low, result.space.dimensions[1].high, 50)
+                            X_mesh, Y_mesh = np.meshgrid(x_values, y_values)
+                            
+                            # Predict Z values using the surrogate model
+                            Z_mesh_pred = np.array([gpr.predict(np.array([x, y]).reshape(1, -1))[0] for x, y in zip(np.ravel(X_mesh), np.ravel(Y_mesh))]).reshape(X_mesh.shape)
+                            
+                            fig_surface = go.Figure(data=[go.Surface(z=Z_mesh_pred, x=X_mesh, y=Y_mesh, colorscale='Viridis')])
+                            fig_surface.update_layout(title='Optimization Landscape (Surrogate Model)',
+                                                      scene = dict(xaxis_title=features[0], yaxis_title=features[1], zaxis_title=st.session_state.target_for_opt),
+                                                      autosize=False,
+                                                      width=800, height=600,
+                                                      margin=dict(l=65, r=50, b=65, t=90))
+                            st.session_state.opt_landscape_fig = fig_surface
+                            st.plotly_chart(fig_surface)
+
+                            # Partial Dependence Plots (using PyCaret's plot_model functionality if applicable, or custom)
+                            # PyCaret's plot_model for 'residuals', 'error', 'boundary', 'rfe', etc. might be used here.
+                            # For partial dependence, skopt provides plot_objective, but it uses matplotlib.
+                            # Let's create a custom Plotly version for consistent output.
+                            
                             st.write("#### Partial Dependence Plots")
-                            # ... [Plotting code as in previous version, using 'gpr' and 'optimal_point']
-                        
+                            for i, feature in enumerate(features):
+                                fig_pd = go.Figure()
+                                # Generate a range of values for the current feature
+                                feature_range = np.linspace(result.space.dimensions[i].low, result.space.dimensions[i].high, 100)
+                                
+                                # Create input points by varying one feature and holding others at the optimal point
+                                fixed_point = list(optimal_point)
+                                predictions = []
+                                for val in feature_range:
+                                    temp_point = list(fixed_point)
+                                    temp_point[i] = val
+                                    predictions.append(gpr.predict(np.array(temp_point).reshape(1, -1))[0])
+                                
+                                fig_pd.add_trace(go.Scatter(x=feature_range, y=predictions, mode='lines', name=f'Partial Dependence: {feature}'))
+                                fig_pd.add_vline(x=optimal_point[i], line_dash="dash", line_color="red", annotation_text="Optimal Point")
+                                fig_pd.update_layout(title=f"Partial Dependence Plot for {feature}", xaxis_title=feature, yaxis_title=st.session_state.target_for_opt)
+                                st.plotly_chart(fig_pd, use_container_width=True)
+
+                        else: # For >2 features, only show partial dependence plots
+                            st.write("#### Partial Dependence Plots")
+                            for i, feature in enumerate(features):
+                                fig_pd = go.Figure()
+                                feature_range = np.linspace(result.space.dimensions[i].low, result.space.dimensions[i].high, 100)
+                                
+                                fixed_point = list(optimal_point)
+                                predictions = []
+                                for val in feature_range:
+                                    temp_point = list(fixed_point)
+                                    temp_point[i] = val
+                                    predictions.append(gpr.predict(np.array(temp_point).reshape(1, -1))[0])
+                                
+                                fig_pd.add_trace(go.Scatter(x=feature_range, y=predictions, mode='lines', name=f'Partial Dependence: {feature}'))
+                                fig_pd.add_vline(x=optimal_point[i], line_dash="dash", line_color="red", annotation_text="Optimal Point")
+                                fig_pd.update_layout(title=f"Partial Dependence Plot for {feature}", xaxis_title=feature, yaxis_title=st.session_state.target_for_opt)
+                                st.plotly_chart(fig_pd, use_container_width=True)
+
                         st.write("#### Convergence Trace")
                         final_model = st.session_state.final_model
                         convergence_preds = final_model.predict(pd.DataFrame(result.x_iters, columns=features))
