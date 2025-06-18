@@ -395,7 +395,7 @@ def handle_dose_response_regression():
         if not perform_dr:
             # If DR is skipped, we still need to set df_5pl_results_merged for the modeling step
             # For LUMOS, df_5pl_results_doe would typically be the tidy data
-            # For Custom, df_5pl_results (which is None here) is fine, and we'll use df_tidy directly
+            # For Custom, df_5pl_results (which is None here) is fine, and we'll use df_tidy directly.
             # When DR is skipped, the "merged" data simply becomes the tidy data for both cases.
             st.session_state.df_tidy_merged = st.session_state.df_tidy.copy() 
             st.session_state.df_5pl_results_merged = None # No DR results, so this should be None for modeling source
@@ -632,39 +632,82 @@ def handle_pycaret_modeling():
         col_prep1, col_prep2, col_prep3 = st.columns(3)
 
         with col_prep1:
-            normalize = st.checkbox("Normalize Data", value=True, key="pycaret_normalize")
+            normalize = st.checkbox(
+                "Normalize Data", 
+                value=True, 
+                key="pycaret_normalize",
+                help="Scales numerical features to a standard range (e.g., between 0 and 1, or mean 0 and std 1). This helps algorithms sensitive to feature magnitudes perform better."
+            )
             if normalize:
                 normalize_method = st.selectbox(
                     "Normalization Method:",
                     options=['zscore', 'minmax', 'maxabs', 'robust'],
-                    key="pycaret_normalize_method"
+                    index=0, # Default to zscore
+                    key="pycaret_normalize_method",
+                    help="""
+                    - **zscore**: Transforms data to have a mean of 0 and standard deviation of 1. Good for general use.
+                    - **minmax**: Scales data to a range between 0 and 1. Useful for neural networks.
+                    - **maxabs**: Scales data to a range between -1 and 1 by dividing by the maximum absolute value. Preserves sparsity.
+                    - **robust**: Scales data using statistics that are robust to outliers (median and interquartile range), useful if your data has many outliers.
+                    """
                 )
             else:
                 normalize_method = None
             
-            remove_outliers = st.checkbox("Remove Outliers (Isolation Forest)", value=False, key="pycaret_remove_outliers")
+            remove_outliers = st.checkbox(
+                "Remove Outliers (Isolation Forest)", 
+                value=False, # Default to False, as outlier removal can be risky
+                key="pycaret_remove_outliers",
+                help="Identifies and removes data points that are significantly different from other observations using the Isolation Forest algorithm. Outliers can negatively impact model training, but removing them might discard valuable information."
+            )
             
         with col_prep2:
-            transformation = st.checkbox("Apply Power Transformation (Numerical)", value=False, key="pycaret_transformation")
+            transformation = st.checkbox(
+                "Apply Power Transformation (Numerical)", 
+                value=False, # Default to False
+                key="pycaret_transformation",
+                help="Applies a power transformation (e.g., Box-Cox or Yeo-Johnson) to make numerical features more Gaussian-like (bell-shaped distribution). This can improve model performance, especially for linear models and neural networks."
+            )
             
-            remove_multicollinearity = st.checkbox("Remove Multicollinearity", value=False, key="pycaret_remove_multicollinearity")
+            remove_multicollinearity = st.checkbox(
+                "Remove Multicollinearity", 
+                value=False, # Default to False, can be useful but also removes features
+                key="pycaret_remove_multicollinearity",
+                help="Removes highly correlated (linearly dependent) features. Multicollinearity can make models unstable, difficult to interpret, and lead to overfitting."
+            )
             if remove_multicollinearity:
                 multicollinearity_threshold = st.slider(
                     "Multicollinearity Threshold (correlation)",
                     min_value=0.5, max_value=1.0, value=0.9, step=0.05,
-                    key="pycaret_multicollinearity_threshold"
+                    key="pycaret_multicollinearity_threshold",
+                    help="The maximum allowed absolute correlation between features. Features with a correlation above this threshold will be considered for removal to reduce multicollinearity."
                 )
             else:
                 multicollinearity_threshold = None
 
         with col_prep3:
-            feature_interaction = st.checkbox("Create Feature Interaction (Polynomial)", value=False, key="pycaret_feature_interaction")
+            feature_interaction = st.checkbox(
+                "Create Feature Interaction (Polynomial)", 
+                value=False, # Default to False, as it increases complexity
+                key="pycaret_feature_interaction",
+                help="Generates new features by multiplying existing numerical features (e.g., creating a 'length * width' feature). This allows the model to capture more complex non-linear relationships, but increases dimensionality."
+            )
             if feature_interaction:
-                polynomial_degree = st.number_input("Polynomial Degree:", min_value=2, max_value=3, value=2, key="pycaret_polynomial_degree")
+                polynomial_degree = st.number_input(
+                    "Polynomial Degree:", 
+                    min_value=2, max_value=3, value=2, 
+                    key="pycaret_polynomial_degree",
+                    help="The maximum power to which features will be raised and combined. A degree of 2 includes terms like $X_1^2$, $X_2^2$, $X_1X_2$. Higher degrees create more complex interactions."
+                )
             else:
                 polynomial_degree = None
             
-            feature_selection = st.checkbox("Perform Feature Selection", value=False, key="pycaret_feature_selection")
+            feature_selection = st.checkbox(
+                "Perform Feature Selection", 
+                value=False, # Default to False, can be computationally intensive or remove useful features
+                key="pycaret_feature_selection",
+                help="Automatically selects the most relevant features to improve model performance and reduce complexity. This can help prevent overfitting, especially with high-dimensional data, and speed up training."
+            )
 
         if st.button("Run PyCaret Analysis", key="run_pycaret_button"):
             with st.spinner("Setting up PyCaret environment and comparing models..."):
