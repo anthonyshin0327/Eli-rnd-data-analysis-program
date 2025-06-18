@@ -77,7 +77,8 @@ def get_excel_download_link(dfs_dict, filename):
                 except Exception as e:
                     st.warning(f"Could not write sheet '{sheet_name}': {e}")
     excel_data = output.getvalue()
-    b64 = base66.b64encode(excel_data).decode()
+    # Fixed: Changed base66 to base64
+    b64 = base64.b64encode(excel_data).decode() 
     href = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}">Download Full Report (XLSX)</a>'
     return href
 
@@ -395,7 +396,9 @@ def handle_dose_response_regression():
             # If DR is skipped, we still need to set df_5pl_results_merged for the modeling step
             # For LUMOS, df_5pl_results_doe would typically be the tidy data
             # For Custom, df_5pl_results (which is None here) is fine, and we'll use df_tidy directly
-            st.session_state.df_5pl_results_merged = st.session_state.df_tidy.copy() # Placeholder for merged data if DR is skipped
+            # When DR is skipped, the "merged" data simply becomes the tidy data for both cases.
+            st.session_state.df_tidy_merged = st.session_state.df_tidy.copy() 
+            st.session_state.df_5pl_results_merged = None # No DR results, so this should be None for modeling source
             st.session_state.df_5pl_results = None # Explicitly set to None as no DR results
             st.info("Skipping dose-response. The Tidy Data from Step 1 will be passed directly to the modeling step.")
             return
@@ -545,34 +548,43 @@ def handle_pycaret_modeling():
             st.subheader("1. Custom Data for Modeling")
             st.info("For custom data, it is assumed your uploaded table is already prepared for modeling. No DoE factor merging is required.")
             st.session_state.df_tidy_merged = base_df_tidy.copy()
-            st.session_state.df_5pl_results_merged = base_df_params.copy() if base_df_params is not None else None
+            # If DR was performed on custom data, use its results; otherwise, it's None and we'll use tidy data directly.
+            if st.session_state.get('df_5pl_results') is not None:
+                st.session_state.df_5pl_results_merged = st.session_state.df_5pl_results.copy()
+            else:
+                st.session_state.df_5pl_results_merged = None # No dose-response results to merge
             
-            # For custom data, all numeric columns (excluding response variables if from tidy) are potential features
+            # For custom data, all numeric columns (excluding common response variables) are potential features
             if st.session_state.df_tidy_merged is not None:
                 feature_options = st.session_state.df_tidy_merged.select_dtypes(include=np.number).columns.tolist()
                 # Remove common response variables from initial feature options if present
-                y_vars_common = ['T', 'C', 'T_norm', 'C_norm', 'T-C', 'C/T', 'T/C', 'T+C', 'a', 'b', 'c', 'd', 'g', 'R-squared']
-                feature_options = [f for f in feature_options if f not in y_vars_common]
-
-
+                y_vars_common_from_tidy = ['T', 'C', 'T_norm', 'C_norm', 'T-C', 'C/T', 'T/C', 'T+C']
+                feature_options = [f for f in feature_options if f not in y_vars_common_from_tidy]
+                
         st.subheader("2. Automated Model Training with PyCaret")
         
         modeling_source_options = []
-        if st.session_state.get('df_tidy_merged') is not None:
+        # Decide which dataframes are available for modeling
+        if st.session_state.get('df_tidy_merged') is not None and not st.session_state.df_tidy_merged.empty:
             modeling_source_options.append("Raw/Tidy Data")
-        if st.session_state.get('df_5pl_results_merged') is not None:
+        if st.session_state.get('df_5pl_results_merged') is not None and not st.session_state.df_5pl_results_merged.empty:
             modeling_source_options.append("Dose-Response Parameters")
 
         if not modeling_source_options:
             st.info("Please process data in previous steps to proceed with modeling.")
             return
 
-        modeling_source = st.radio(
-            "Select data source for modeling:",
-            options=modeling_source_options,
-            horizontal=True,
-            key="pycaret_source_radio"
-        )
+        # UI improvement: If only one option, display it as text instead of a radio button
+        if len(modeling_source_options) == 1:
+            modeling_source = modeling_source_options[0]
+            st.markdown(f"**Selected data source for modeling:** `{modeling_source}`")
+        else:
+            modeling_source = st.radio(
+                "Select data source for modeling:",
+                options=modeling_source_options,
+                horizontal=True,
+                key="pycaret_source_radio"
+            )
 
         df_for_modeling = None
         if modeling_source == "Raw/Tidy Data":
@@ -580,31 +592,25 @@ def handle_pycaret_modeling():
         else: # "Dose-Response Parameters"
             df_for_modeling = st.session_state.get('df_5pl_results_merged')
 
-        if df_for_modeling is None:
-            if modeling_source == "Dose-Response Parameters" and st.session_state.get('perform_dr') == False:
-                 st.warning("Dose-Response Analysis was skipped. Please select 'Raw/Tidy Data' as the modeling source.")
-            elif modeling_source == "Dose-Response Parameters" and st.session_state.get('df_5pl_results') is None:
-                 st.warning("Dose-Response Analysis did not yield results. Please select 'Raw/Tidy Data' as the modeling source.")
-            else:
-                 st.error("Selected modeling data source is not available. Please ensure data is processed correctly.")
+        if df_for_modeling is None or df_for_modeling.empty:
+            st.error(f"Selected modeling data source ('{modeling_source}') is not available or is empty. Please ensure data is processed correctly and contains sufficient rows.")
             return
 
         all_numeric_cols = df_for_modeling.select_dtypes(include=np.number).columns.tolist()
         
-        # Filter feature_options based on selected df_for_modeling
+        # Refine feature_options based on the selected modeling_source and available columns
         if modeling_source == "Raw/Tidy Data":
-            # For Raw/Tidy Data, use selected features if LUMOS, otherwise all numeric less target/response
             if st.session_state.data_source == 'LUMOS':
-                # feature_options already derived from factor_names for LUMOS
-                pass 
+                # feature_options already derived from factor_names for LUMOS in this block
+                # Ensure only numeric features are included
+                feature_options = [f for f in feature_options if f in all_numeric_cols]
             else: # Custom
-                feature_options = [col for col in all_numeric_cols if col not in y_vars] # Avoid response vars from tidy
+                # For custom, all numeric columns except the target are potential features
+                feature_options = [col for col in all_numeric_cols if col not in ['T', 'C', 'T_norm', 'C_norm', 'T-C', 'C/T', 'T/C', 'T+C']]
         else: # Dose-Response Parameters
-            # For DR Parameters, all numeric columns (except R-squared if it's the target) are potential features
-            feature_options = [col for col in all_numeric_cols if col != 'R-squared']
-            # Also filter out 'a', 'b', 'c', 'd', 'g' if they are not meant to be features
-            dr_param_cols = ['a', 'b', 'c', 'd', 'g']
-            feature_options = [f for f in feature_options if f not in dr_param_cols]
+            # For DR Parameters, all numeric columns (except R-squared and DR parameters a,b,c,d,g if they are not features) are potential features
+            dr_param_cols = ['a', 'b', 'c', 'd', 'g', 'R-squared'] # R-squared is often a target, not a feature
+            feature_options = [col for col in all_numeric_cols if col not in dr_param_cols]
 
 
         target_col = st.selectbox("Select Target (Y):", all_numeric_cols, key="pycaret_target_selector")
@@ -660,12 +666,13 @@ def handle_pycaret_modeling():
             
             feature_selection = st.checkbox("Perform Feature Selection", value=False, key="pycaret_feature_selection")
 
-
         if st.button("Run PyCaret Analysis", key="run_pycaret_button"):
             with st.spinner("Setting up PyCaret environment and comparing models..."):
                 data = df_for_modeling[features + [target_col]].dropna().drop_duplicates()
                 
                 # Identify categorical features if any exist in the selected features
+                # PyCaret's setup automatically handles numeric/categorical if not explicitly provided,
+                # but explicit definition is robust.
                 categorical_features = data[features].select_dtypes(include='object').columns.tolist()
                 numeric_features = data[features].select_dtypes(include=np.number).columns.tolist()
 
@@ -685,18 +692,16 @@ def handle_pycaret_modeling():
                                 polynomial_features=feature_interaction, # PyCaret uses polynomial_features for interaction terms
                                 polynomial_degree=polynomial_degree,
                                 feature_selection=feature_selection,
-                                # Default imputation strategies are 'zero' for numeric and 'constant' for categorical.
-                                # pycaret also offers `numeric_imputation` and `categorical_imputation`
-                                # For simplicity, keeping default or adding specific dropdown if user requests more control.
-                                # For now, let's allow `simple` imputation for numeric and categorical
-                                numeric_imputation='mean', # or 'median', 'zero'
-                                categorical_imputation='mode', # or 'not_found', 'zero'
+                                # Common imputation strategies
+                                numeric_imputation='mean', 
+                                categorical_imputation='mode', 
                                 handle_unknown_categorical=True,
                                 unknown_categorical_method='most_frequent',
-                                # Other useful parameters can be added as needed:
-                                # bin_numeric_features=['col1', 'col2']
-                                # combine_rare_levels=True
-                                # ignore_low_variance=True
+                                # Other useful parameters to consider enabling by default or with user options
+                                ignore_low_variance=True, # Removes features with low variance (e.g., almost constant values)
+                                combine_rare_levels=True, # Combines rare levels in categorical features
+                                bin_numeric_features=None, # Can be ['col1', 'col2'] to bin numerical features
+                                remove_perfect_collinearity=True, # Remove columns with perfect collinearity
                                 )
 
                 # Show setup output as HTML
