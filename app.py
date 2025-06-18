@@ -431,24 +431,27 @@ def handle_dose_response_regression():
         col1, col2, col3 = st.columns(3)
         conc_col = col1.selectbox("Concentration column:", 
                                   concentration_options, 
-                                  index=concentration_options.index(st.session_state.get('dr_conc_col', concentration_options[0])) if concentration_options else 0, # Persist selection
+                                  # Use session state to retrieve the default value if available, else first option
+                                  index=concentration_options.index(st.session_state.get('dr_conc_col', concentration_options[0])) if 'dr_conc_col' in st.session_state and st.session_state.dr_conc_col in concentration_options else 0,
                                   key="dr_conc_col")
-        st.session_state.dr_conc_col = conc_col # Store selected value
+        # No explicit st.session_state assignment here; selectbox handles it internally.
         
         group_by_col = col2.selectbox(
             "Group analysis by:", 
             grouping_options, 
-            index=grouping_options.index(st.session_state.get('dr_group_col', grouping_options[0])) if grouping_options else 0, # Persist selection
+            # Use session state to retrieve the default value if available, else first option
+            index=grouping_options.index(st.session_state.get('dr_group_col', grouping_options[0])) if 'dr_group_col' in st.session_state and st.session_state.dr_group_col in grouping_options else 0,
             key="dr_group_col", 
             help="A model will be fit for each unique value in this column."
         )
-        st.session_state.dr_group_col = group_by_col # Store selected value
+        # No explicit st.session_state assignment here; selectbox handles it internally.
 
         y_var = col3.selectbox("Response variable (Y-axis):", 
                                y_vars, 
-                               index=y_vars.index(st.session_state.get('dr_y_var', 'T_norm')), # Default to 'T_norm', persist selection
+                               # Use session state to retrieve the default value if available, else first option (T_norm)
+                               index=y_vars.index(st.session_state.get('dr_y_var', 'T_norm')) if 'dr_y_var' in st.session_state and st.session_state.dr_y_var in y_vars else y_vars.index('T_norm'),
                                key="dr_y_var")
-        st.session_state.dr_y_var = y_var # Store selected value
+        # No explicit st.session_state assignment here; selectbox handles it internally.
         
         if st.button("Run Dose-Response Analysis", key="run_dr_button"):
             with st.spinner("Fitting models..."):
@@ -515,7 +518,8 @@ def handle_dose_response_regression():
             df = st.session_state.df_tidy.copy()
             
             # Ensure conc_col, group_by_col, and y_var are available before plotting
-            if st.session_state.get('dr_conc_col') and st.session_state.get('dr_group_col') and st.session_state.get('dr_y_var'):
+            # Retrieve values directly from session_state as they are automatically managed by the selectbox keys
+            if 'dr_conc_col' in st.session_state and 'dr_group_col' in st.session_state and 'dr_y_var' in st.session_state:
                 conc_col_plot = st.session_state.dr_conc_col
                 group_by_col_plot = st.session_state.dr_group_col
                 y_var_plot = st.session_state.dr_y_var
@@ -635,25 +639,28 @@ def handle_pycaret_modeling():
             st.info("Please process data in previous steps to proceed with modeling.")
             return
 
+        # Determine the index for the default selected option
+        default_source_index = 0
+        if 'current_modeling_source' in st.session_state and st.session_state.current_modeling_source in modeling_source_options:
+            default_source_index = modeling_source_options.index(st.session_state.current_modeling_source)
+        elif 'df_5pl_results_merged' in st.session_state and st.session_state.df_5pl_results_merged is not None and not st.session_state.df_5pl_results_merged.empty and "Dose-Response Parameters" in modeling_source_options:
+            # If DR results are available, default to them, otherwise default to "Raw/Tidy Data"
+            default_source_index = modeling_source_options.index("Dose-Response Parameters")
+        else: # Default to 'Raw/Tidy Data' if no DR results or if DR was skipped
+            if "Raw/Tidy Data" in modeling_source_options:
+                default_source_index = modeling_source_options.index("Raw/Tidy Data")
+            else:
+                default_source_index = 0 # Fallback, should ideally not happen if options list is non-empty
+
+
         # UI improvement: If only one option, display it as text instead of a radio button
         if len(modeling_source_options) == 1:
             modeling_source = modeling_source_options[0]
             st.markdown(f"**Selected data source for modeling:** `{modeling_source}`")
-            # Ensure the current_modeling_source is explicitly set, especially after a fresh DR run
             st.session_state.current_modeling_source = modeling_source 
-            # If there was a radio button before with multiple options, remove its key to prevent issues
-            if 'pycaret_source_radio' in st.session_state:
+            if 'pycaret_source_radio' in st.session_state: # Clear previous radio button state if it existed
                 del st.session_state['pycaret_source_radio']
         else:
-            # If multiple options, use the radio button and set its default
-            default_source_index = 0
-            if 'current_modeling_source' in st.session_state and st.session_state.current_modeling_source in modeling_source_options:
-                default_source_index = modeling_source_options.index(st.session_state.current_modeling_source)
-            elif 'df_5pl_results_merged' in st.session_state and st.session_state.df_5pl_results_merged is not None and not st.session_state.df_5pl_results_merged.empty and "Dose-Response Parameters" in modeling_source_options:
-                # If DR results are available, default to them, otherwise default to "Raw/Tidy Data"
-                default_source_index = modeling_source_options.index("Dose-Response Parameters")
-
-
             modeling_source = st.radio(
                 "Select data source for modeling:",
                 options=modeling_source_options,
@@ -707,7 +714,7 @@ def handle_pycaret_modeling():
             index=default_target_index, 
             key="pycaret_target_selector"
         )
-        st.session_state.pycaret_target_selector = target_col # Store selected target
+        # No explicit st.session_state assignment here; selectbox handles it internally.
 
 
         # Ensure target is not in feature options
@@ -725,7 +732,7 @@ def handle_pycaret_modeling():
             default=default_features, 
             key="pycaret_features_selector"
         )
-        st.session_state.pycaret_features_selector = features # Store selected features
+        # No explicit st.session_state assignment here; multiselect handles it internally.
         
         st.session_state.modeling_df_for_opt = df_for_modeling
         st.session_state.features_for_opt = features
