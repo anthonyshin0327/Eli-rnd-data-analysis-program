@@ -396,11 +396,12 @@ def handle_dose_response_regression():
 
         # Use a consistent key for toggles across app reruns
         perform_dr = st.toggle("Perform Dose-Response Regression?", 
-                                value=st.session_state.get('perform_dr', True), # Default to True
-                                key="perform_dr")
+                                value=st.session_state.get('perform_dr', True), # Default to True if not set
+                                key="perform_dr_toggle") # Renamed key to avoid conflict with st.session_state.perform_dr assignment
         
-        # Store the current state of the toggle in session_state
-        st.session_state.perform_dr = perform_dr
+        # The toggle automatically updates st.session_state['perform_dr_toggle'].
+        # We need to map this back to st.session_state.perform_dr for consistent logic.
+        st.session_state.perform_dr = perform_dr 
 
         if not perform_dr:
             # If DR is skipped, the modeling step should use df_tidy directly
@@ -611,10 +612,8 @@ def handle_pycaret_modeling():
         if len(modeling_source_options) == 1:
             modeling_source = modeling_source_options[0]
             st.markdown(f"**Selected data source for modeling:** `{modeling_source}`")
-            # Ensure the radio button's value is also set for consistency if it was an actual radio button before
-            if 'pycaret_source_radio' in st.session_state:
-                del st.session_state['pycaret_source_radio'] # Remove the key if it exists to avoid conflicts
-            # Directly assign to a new session state key if needed by PyCaret setup later
+            # This branch ensures consistent behavior with the `modeling_source` variable
+            # It also makes sure `st.session_state.current_modeling_source` is set correctly.
             st.session_state.current_modeling_source = modeling_source 
         else:
             # If multiple options, use the radio button and set its default
@@ -1046,7 +1045,7 @@ def handle_bayesian_optimization():
                                                       width=800, height=600,
                                                       margin=dict(l=65, r=50, b=65, t=90))
                             st.session_state.opt_landscape_fig = fig_surface
-                            st.plotly_chart(fig_surface)
+                            st.plotly_chart(fig_surface, use_container_width=True) # Added use_container_width
 
                             # Partial Dependence Plots (using PyCaret's plot_model functionality if applicable, or custom)
                             # PyCaret's plot_model for 'residuals', 'error', 'boundary', 'rfe', etc. might be used here.
