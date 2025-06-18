@@ -77,7 +77,7 @@ def get_excel_download_link(dfs_dict, filename):
                 except Exception as e:
                     st.warning(f"Could not write sheet '{sheet_name}': {e}")
     excel_data = output.getvalue()
-    b64 = base64.b64encode(excel_data).decode()
+    b64 = base66.b64encode(excel_data).decode()
     href = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}">Download Full Report (XLSX)</a>'
     return href
 
@@ -392,9 +392,12 @@ def handle_dose_response_regression():
         perform_dr = st.toggle("Perform Dose-Response Regression?", value=True, key="perform_dr")
         
         if not perform_dr:
-            st.session_state.df_5pl_results_doe = st.session_state.df_tidy.copy()
+            # If DR is skipped, we still need to set df_5pl_results_merged for the modeling step
+            # For LUMOS, df_5pl_results_doe would typically be the tidy data
+            # For Custom, df_5pl_results (which is None here) is fine, and we'll use df_tidy directly
+            st.session_state.df_5pl_results_merged = st.session_state.df_tidy.copy() # Placeholder for merged data if DR is skipped
+            st.session_state.df_5pl_results = None # Explicitly set to None as no DR results
             st.info("Skipping dose-response. The Tidy Data from Step 1 will be passed directly to the modeling step.")
-            st.session_state.df_5pl_results = None
             return
         
         model_choice = st.radio("Select Model", ("5PL", "4PL"), key="dr_model_choice", horizontal=True)
@@ -504,47 +507,64 @@ def handle_pycaret_modeling():
             st.info("Complete Step 1 to generate the data needed for this step.")
             return
 
-        st.subheader("1. Define & Merge DoE Factors")
-        
-        grouping_col = st.selectbox("Select the column that defines your experimental groups:", options=base_df_tidy.columns, index=0, key="pycaret_grouping_col")
+        feature_options = []
+        if st.session_state.data_source == 'LUMOS':
+            st.subheader("1. Define & Merge DoE Factors (LUMOS Data)")
+            
+            grouping_col = st.selectbox("Select the column that defines your experimental groups:", options=base_df_tidy.columns, index=0, key="pycaret_grouping_col")
 
-        if grouping_col:
-            unique_groups = pd.DataFrame(base_df_tidy[grouping_col].unique(), columns=[grouping_col]).sort_values(by=grouping_col).reset_index(drop=True)
-            st.write(f"Enter the DoE factor values for each unique group in **'{grouping_col}'**.")
-            
-            num_factors = st.number_input("Number of DoE Factors", min_value=1, value=1, key="pycaret_num_factors")
-            factor_names = [st.text_input(f"Factor {i+1} Name", f"DoE_Factor_{i+1}", key=f"pycaret_factor_name_{i}") for i in range(num_factors)]
+            if grouping_col:
+                unique_groups = pd.DataFrame(base_df_tidy[grouping_col].unique(), columns=[grouping_col]).sort_values(by=grouping_col).reset_index(drop=True)
+                st.write(f"Enter the DoE factor values for each unique group in **'{grouping_col}'**.")
+                
+                num_factors = st.number_input("Number of DoE Factors", min_value=1, value=1, key="pycaret_num_factors")
+                factor_names = [st.text_input(f"Factor {i+1} Name", f"DoE_Factor_{i+1}", key=f"pycaret_factor_name_{i}") for i in range(num_factors)]
 
-            doe_input_df = unique_groups.copy()
-            for name in factor_names:
-                doe_input_df[name] = 0.0
+                doe_input_df = unique_groups.copy()
+                for name in factor_names:
+                    doe_input_df[name] = 0.0
+                
+                edited_doe_df = st.data_editor(doe_input_df, key="pycaret_doe_factor_editor", use_container_width=True)
+                
+                df_tidy_merged = pd.merge(base_df_tidy, edited_doe_df, on=grouping_col, how='left')
+                st.session_state.df_tidy_merged = df_tidy_merged
+                
+                if base_df_params is not None:
+                    base_df_params_renamed = base_df_params.rename(columns={'Group': grouping_col})
+                    df_params_merged = pd.merge(base_df_params_renamed, edited_doe_df, on=grouping_col, how='left')
+                    st.session_state.df_5pl_results_merged = df_params_merged
+                
+                st.subheader("Checkpoint: Merged Tidy Data")
+                st.dataframe(st.session_state.df_tidy_merged)
+                if st.session_state.get('df_5pl_results_merged') is not None:
+                    st.subheader("Checkpoint: Merged Dose-Response Results")
+                    st.dataframe(st.session_state.df_5pl_results_merged)
+                
+                feature_options = [col for col in factor_names if col in df_tidy_merged.columns] # Use merged features
+        else: # Custom Data
+            st.subheader("1. Custom Data for Modeling")
+            st.info("For custom data, it is assumed your uploaded table is already prepared for modeling. No DoE factor merging is required.")
+            st.session_state.df_tidy_merged = base_df_tidy.copy()
+            st.session_state.df_5pl_results_merged = base_df_params.copy() if base_df_params is not None else None
             
-            edited_doe_df = st.data_editor(doe_input_df, key="pycaret_doe_factor_editor", use_container_width=True)
-            
-            df_tidy_merged = pd.merge(base_df_tidy, edited_doe_df, on=grouping_col, how='left')
-            st.session_state.df_tidy_merged = df_tidy_merged
-            
-            if base_df_params is not None:
-                base_df_params_renamed = base_df_params.rename(columns={'Group': grouping_col})
-                df_params_merged = pd.merge(base_df_params_renamed, edited_doe_df, on=grouping_col, how='left')
-                st.session_state.df_5pl_results_merged = df_params_merged
-            
-            st.subheader("Checkpoint: Merged Tidy Data")
-            st.dataframe(st.session_state.df_tidy_merged)
-            if st.session_state.get('df_5pl_results_merged') is not None:
-                st.subheader("Checkpoint: Merged Dose-Response Results")
-                st.dataframe(st.session_state.df_5pl_results_merged)
+            # For custom data, all numeric columns (excluding response variables if from tidy) are potential features
+            if st.session_state.df_tidy_merged is not None:
+                feature_options = st.session_state.df_tidy_merged.select_dtypes(include=np.number).columns.tolist()
+                # Remove common response variables from initial feature options if present
+                y_vars_common = ['T', 'C', 'T_norm', 'C_norm', 'T-C', 'C/T', 'T/C', 'T+C', 'a', 'b', 'c', 'd', 'g', 'R-squared']
+                feature_options = [f for f in feature_options if f not in y_vars_common]
+
 
         st.subheader("2. Automated Model Training with PyCaret")
         
         modeling_source_options = []
         if st.session_state.get('df_tidy_merged') is not None:
-            modeling_source_options.append("Merged Tidy Data")
+            modeling_source_options.append("Raw/Tidy Data")
         if st.session_state.get('df_5pl_results_merged') is not None:
-            modeling_source_options.append("Merged Dose-Response Results")
+            modeling_source_options.append("Dose-Response Parameters")
 
         if not modeling_source_options:
-            st.info("Please define and merge DoE factors above to proceed with modeling.")
+            st.info("Please process data in previous steps to proceed with modeling.")
             return
 
         modeling_source = st.radio(
@@ -555,20 +575,44 @@ def handle_pycaret_modeling():
         )
 
         df_for_modeling = None
-        if modeling_source == "Merged Tidy Data":
+        if modeling_source == "Raw/Tidy Data":
             df_for_modeling = st.session_state.get('df_tidy_merged')
-        else:
+        else: # "Dose-Response Parameters"
             df_for_modeling = st.session_state.get('df_5pl_results_merged')
 
         if df_for_modeling is None:
-            st.error("Selected modeling data source is not available.")
+            if modeling_source == "Dose-Response Parameters" and st.session_state.get('perform_dr') == False:
+                 st.warning("Dose-Response Analysis was skipped. Please select 'Raw/Tidy Data' as the modeling source.")
+            elif modeling_source == "Dose-Response Parameters" and st.session_state.get('df_5pl_results') is None:
+                 st.warning("Dose-Response Analysis did not yield results. Please select 'Raw/Tidy Data' as the modeling source.")
+            else:
+                 st.error("Selected modeling data source is not available. Please ensure data is processed correctly.")
             return
 
         all_numeric_cols = df_for_modeling.select_dtypes(include=np.number).columns.tolist()
-        feature_options = [col for col in factor_names if col in df_for_modeling.columns]
         
+        # Filter feature_options based on selected df_for_modeling
+        if modeling_source == "Raw/Tidy Data":
+            # For Raw/Tidy Data, use selected features if LUMOS, otherwise all numeric less target/response
+            if st.session_state.data_source == 'LUMOS':
+                # feature_options already derived from factor_names for LUMOS
+                pass 
+            else: # Custom
+                feature_options = [col for col in all_numeric_cols if col not in y_vars] # Avoid response vars from tidy
+        else: # Dose-Response Parameters
+            # For DR Parameters, all numeric columns (except R-squared if it's the target) are potential features
+            feature_options = [col for col in all_numeric_cols if col != 'R-squared']
+            # Also filter out 'a', 'b', 'c', 'd', 'g' if they are not meant to be features
+            dr_param_cols = ['a', 'b', 'c', 'd', 'g']
+            feature_options = [f for f in feature_options if f not in dr_param_cols]
+
+
         target_col = st.selectbox("Select Target (Y):", all_numeric_cols, key="pycaret_target_selector")
-        features = st.multiselect("Select Features (X):", feature_options, default=feature_options, key="pycaret_features_selector")
+        
+        # Ensure target is not in feature options
+        current_feature_options_filtered = [f for f in feature_options if f != target_col]
+        
+        features = st.multiselect("Select Features (X):", current_feature_options_filtered, default=current_feature_options_filtered, key="pycaret_features_selector")
         
         st.session_state.modeling_df_for_opt = df_for_modeling
         st.session_state.features_for_opt = features
@@ -578,13 +622,82 @@ def handle_pycaret_modeling():
             st.info("Select a target and at least one feature to begin analysis.")
             return
 
+        st.subheader("3. PyCaret Preprocessing Options")
+        col_prep1, col_prep2, col_prep3 = st.columns(3)
+
+        with col_prep1:
+            normalize = st.checkbox("Normalize Data", value=True, key="pycaret_normalize")
+            if normalize:
+                normalize_method = st.selectbox(
+                    "Normalization Method:",
+                    options=['zscore', 'minmax', 'maxabs', 'robust'],
+                    key="pycaret_normalize_method"
+                )
+            else:
+                normalize_method = None
+            
+            remove_outliers = st.checkbox("Remove Outliers (Isolation Forest)", value=False, key="pycaret_remove_outliers")
+            
+        with col_prep2:
+            transformation = st.checkbox("Apply Power Transformation (Numerical)", value=False, key="pycaret_transformation")
+            
+            remove_multicollinearity = st.checkbox("Remove Multicollinearity", value=False, key="pycaret_remove_multicollinearity")
+            if remove_multicollinearity:
+                multicollinearity_threshold = st.slider(
+                    "Multicollinearity Threshold (correlation)",
+                    min_value=0.5, max_value=1.0, value=0.9, step=0.05,
+                    key="pycaret_multicollinearity_threshold"
+                )
+            else:
+                multicollinearity_threshold = None
+
+        with col_prep3:
+            feature_interaction = st.checkbox("Create Feature Interaction (Polynomial)", value=False, key="pycaret_feature_interaction")
+            if feature_interaction:
+                polynomial_degree = st.number_input("Polynomial Degree:", min_value=2, max_value=3, value=2, key="pycaret_polynomial_degree")
+            else:
+                polynomial_degree = None
+            
+            feature_selection = st.checkbox("Perform Feature Selection", value=False, key="pycaret_feature_selection")
+
+
         if st.button("Run PyCaret Analysis", key="run_pycaret_button"):
             with st.spinner("Setting up PyCaret environment and comparing models..."):
                 data = df_for_modeling[features + [target_col]].dropna().drop_duplicates()
                 
+                # Identify categorical features if any exist in the selected features
+                categorical_features = data[features].select_dtypes(include='object').columns.tolist()
+                numeric_features = data[features].select_dtypes(include=np.number).columns.tolist()
+
                 # Setup PyCaret
                 s = pyreg.setup(data, target=target_col, session_id=123,
-                                html=True, silent=True, log_experiment=True, experiment_name='lfa_doe')
+                                html=True, silent=True, log_experiment=True, experiment_name='lfa_doe',
+                                # Preprocessing options
+                                numeric_features=numeric_features,
+                                categorical_features=categorical_features,
+                                normalize=normalize,
+                                normalize_method=normalize_method,
+                                transformation=transformation,
+                                remove_outliers=remove_outliers,
+                                remove_multicollinearity=remove_multicollinearity,
+                                multicollinearity_threshold=multicollinearity_threshold,
+                                feature_interaction=feature_interaction,
+                                polynomial_features=feature_interaction, # PyCaret uses polynomial_features for interaction terms
+                                polynomial_degree=polynomial_degree,
+                                feature_selection=feature_selection,
+                                # Default imputation strategies are 'zero' for numeric and 'constant' for categorical.
+                                # pycaret also offers `numeric_imputation` and `categorical_imputation`
+                                # For simplicity, keeping default or adding specific dropdown if user requests more control.
+                                # For now, let's allow `simple` imputation for numeric and categorical
+                                numeric_imputation='mean', # or 'median', 'zero'
+                                categorical_imputation='mode', # or 'not_found', 'zero'
+                                handle_unknown_categorical=True,
+                                unknown_categorical_method='most_frequent',
+                                # Other useful parameters can be added as needed:
+                                # bin_numeric_features=['col1', 'col2']
+                                # combine_rare_levels=True
+                                # ignore_low_variance=True
+                                )
 
                 # Show setup output as HTML
                 setup_html_path = "pycaret_setup_output.html"
