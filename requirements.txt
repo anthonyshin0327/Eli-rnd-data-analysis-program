@@ -1,11 +1,12 @@
-streamlit
-pandas
-numpy
-plotly
-pycaret
-scipy
-fpdf
-scikit-learn # For r2_score
-scikit-optimize # For skopt (Bayesian Optimization)
-openpyxl # For Excel export
-kaleido # If you want static Plotly image export
+dash==2.17.0
+dash-bootstrap-components==1.6.0
+pandas==2.2.2
+numpy==1.26.4
+plotly==5.20.0
+pycaret==3.2.0
+scipy==1.13.1
+fpdf==1.7.2
+kaleido==0.2.1
+scikit-optimize==0.9.0
+scikit-learn==1.4.2
+openpyxl==3.1.2
