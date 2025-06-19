@@ -1,320 +1,390 @@
 import gradio as gr
 import pandas as pd
-from pycaret.regression import *
 import plotly.express as px
 import plotly.graph_objects as go
 import os
-import secrets
 import shutil
 import numpy as np
-from itertools import combinations
+from itertools import product
 import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from contextlib import redirect_stdout
-import io
 from scipy.optimize import curve_fit
 import re
+from collections import defaultdict
+import pycaret.regression as reg
+import pycaret.classification as clf
 
-# --- Scientific & Helper Functions ---
+# --- Configuration & Setup ---
+# Ensure kaleido is installed: pip install kaleido
+TEMP_PLOT_DIR = "temp_plots"
+
+def setup_temp_dir():
+    """Clears and recreates the temporary directory for storing plot images."""
+    if os.path.exists(TEMP_PLOT_DIR):
+        shutil.rmtree(TEMP_PLOT_DIR)
+    os.makedirs(TEMP_PLOT_DIR)
+
+# --- Core Data & Naming Logic ---
+
+def get_backend_name(original_name):
+    """Creates a backend-safe identifier from a user-facing column name."""
+    name = str(original_name)
+    name = name.replace('/', '_div_')
+    name = name.replace('-', '_minus_')
+    name = re.sub(r'[^A-Za-z0-9_]+', '_', name)
+    if name.startswith('_'): name = 'col' + name
+    return name
+
+def create_name_map(columns):
+    """Creates a mapping from backend-safe names to original, user-friendly names."""
+    return {get_backend_name(col): col for col in columns}
+
+def process_lumos_data(df):
+    """Processes raw data to create analytical features with user-friendly names."""
+    processed_df = df.copy()
+    rename_map = {
+        'line_peak_above_background_1': 'T',
+        'line_peak_above_background_2': 'C'
+    }
+    processed_df.rename(columns=rename_map, inplace=True)
+    
+    if 'T' in processed_df.columns and 'C' in processed_df.columns:
+        processed_df['T'] = pd.to_numeric(processed_df['T'], errors='coerce')
+        processed_df['C'] = pd.to_numeric(processed_df['C'], errors='coerce')
+        processed_df.dropna(subset=['T', 'C'], inplace=True)
+
+        sum_tc = processed_df['T'] + processed_df['C']
+        processed_df['T_norm'] = np.divide(processed_df['T'], sum_tc, where=sum_tc!=0, out=np.zeros_like(processed_df['T'], dtype=float))
+        processed_df['C_norm'] = np.divide(processed_df['C'], sum_tc, where=sum_tc!=0, out=np.zeros_like(processed_df['C'], dtype=float))
+        processed_df['T-C'] = processed_df['T'] - processed_df['C']
+        processed_df['C/T'] = np.divide(processed_df['C'], processed_df['T'], where=processed_df['T']!=0, out=np.full_like(processed_df['C'], np.inf, dtype=float))
+        processed_df['T/C'] = np.divide(processed_df['T'], processed_df['C'], where=processed_df['C']!=0, out=np.full_like(processed_df['T'], np.inf, dtype=float))
+    return processed_df
 
 def five_pl(x, a, b, c, d, g):
     """Five-parameter logistic function for curve fitting."""
     return d + ((a - d) / (1 + (x / c)**b)**g)
 
-def fit_5pl_and_plot(fig, df, x_col, y_col):
-    """Fits a 5PL curve to data and adds the trace and parameters to a Plotly figure."""
-    df_clean = df[[x_col, y_col]].dropna()
-    xdata = df_clean[x_col]
-    ydata = df_clean[y_col]
+def fit_5pl_and_plot(fig, df, x_col, y_col, group_col=None):
+    """Fits 5PL curves to data and adds them to a Plotly figure."""
+    df_to_fit = df.copy()
+    df_to_fit[x_col] = pd.to_numeric(df_to_fit[x_col], errors='coerce')
+    df_to_fit[y_col] = pd.to_numeric(df_to_fit[y_col], errors='coerce')
+    df_to_fit.dropna(subset=[x_col, y_col], inplace=True)
+    
+    if df_to_fit.empty: return
 
-    if len(df_clean) < 5:
-        return "Not enough data for 5PL fit."
-
-    try:
-        p0 = [min(ydata), 1, np.median(xdata), max(ydata), 1]
-        params, _ = curve_fit(five_pl, xdata, ydata, p0=p0, maxfev=10000)
-        
-        x_fit = np.linspace(min(xdata), max(xdata), 200)
-        y_fit = five_pl(x_fit, *params)
-        fig.add_trace(go.Scatter(x=x_fit, y=y_fit, mode='lines', name='5PL Fit', line=dict(color='cyan', width=2)))
-        
-        equation_text = (f"5PL Fit Parameters:<br>"
-                         f"a(min)={params[0]:.2f}, b(slope)={params[1]:.2f}, c(EC50)={params[2]:.2f}<br>"
-                         f"d(max)={params[3]:.2f}, g(asym)={params[4]:.2f}")
-        return equation_text
-    except Exception as e:
-        print(f"5PL fit failed for {y_col} vs {x_col}: {e}")
-        return "5PL fit failed to converge."
-
-def sanitize_filename(name):
-    """Removes invalid characters from a string to make it a valid filename."""
-    return re.sub(r'[\\/*?:"<>|]',"_", name)
-
-def process_lumos_data(df):
-    """Processes LUMOS data by renaming columns and creating new features."""
-    processed_df = df.copy()
-    if 'strip_name' in processed_df.columns:
+    unique_groups = sorted(df_to_fit[group_col].unique()) if group_col and group_col in df_to_fit.columns else [None]
+    color_map = {label: px.colors.qualitative.Plotly[i % len(px.colors.qualitative.Plotly)] for i, label in enumerate(unique_groups)}
+    
+    for group in unique_groups:
+        group_df = df_to_fit if group is None else df_to_fit[df_to_fit[group_col] == group]
+        if len(group_df) < 5: continue
+        xdata, ydata = group_df[x_col], group_df[y_col]
         try:
-            split_data = processed_df['strip_name'].str.split('-', expand=True)
-            for i in range(split_data.shape[1]):
-                processed_df[f'strip_part_{i+1}'] = split_data[i]
+            p0 = [min(ydata), 1, np.median(xdata), max(ydata), 1]
+            params, _ = curve_fit(five_pl, xdata, ydata, p0=p0, maxfev=10000)
+            x_fit = np.linspace(min(xdata), max(xdata), 200)
+            y_fit = five_pl(x_fit, *params)
+            fig.add_trace(go.Scatter(x=x_fit, y=y_fit, mode='lines', name=f'5PL Fit ({group})' if group else '5PL Fit', line=dict(color=color_map.get(group, 'cyan'), width=2, dash='solid')))
         except Exception as e:
-            print(f"Could not process 'strip_name': {e}")
+            print(f"5PL fit failed for group {group}: {e}")
 
-    if 'line_peak_above_background_1' in processed_df.columns:
-        processed_df = processed_df.rename(columns={'line_peak_above_background_1': 'T'})
-    if 'line_peak_above_background_2' in processed_df.columns:
-        processed_df = processed_df.rename(columns={'line_peak_above_background_2': 'C'})
-
-    if 'T' in processed_df.columns and 'C' in processed_df.columns:
-        for col in ['T', 'C']:
-            processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce')
-        processed_df.dropna(subset=['T', 'C'], inplace=True)
-        
-        sum_tc = processed_df['T'] + processed_df['C']
-        processed_df['T_norm'] = np.divide(processed_df['T'], sum_tc, where=sum_tc != 0, out=np.zeros_like(processed_df['T'], dtype=float))
-        processed_df['C_norm'] = np.divide(processed_df['C'], sum_tc, where=sum_tc != 0, out=np.zeros_like(df['C'], dtype=float))
-        processed_df['T-C'] = processed_df['T'] - processed_df['C']
-        processed_df['C/T'] = np.divide(processed_df['C'], processed_df['T'], where=processed_df['T'] != 0, out=np.full_like(processed_df['C'], np.inf, dtype=float))
-        processed_df['T/C'] = np.divide(processed_df['T'], processed_df['C'], where=processed_df['C'] != 0, out=np.full_like(processed_df['T'], np.inf, dtype=float))
-    return processed_df
+def save_plots_to_temp_dir(plots):
+    """Saves a list of Plotly figures to a temp directory and returns file paths."""
+    setup_temp_dir()
+    plot_files = []
+    for i, fig in enumerate(plots):
+        if fig is not None:
+            plot_path = os.path.join(TEMP_PLOT_DIR, f"plot_{i}.png")
+            try:
+                fig.write_image(plot_path, engine="kaleido")
+                plot_files.append(plot_path)
+            except Exception as e:
+                print(f"Failed to save plot {i}: {e}")
+    return plot_files
 
 # --- Gradio UI Functions ---
 
 def upload_and_process_data(file, progress=gr.Progress()):
-    if file is None:
-        return None, None, None, "Please upload a CSV file.", gr.update(choices=[]), gr.update(choices=[]), gr.update(choices=[])
+    """Handles file upload, data processing, and state initialization with new defaults."""
+    error_return_values = (
+        None, None, {}, "Please upload a CSV file.", 
+        gr.update(choices=[]), gr.update(choices=[]), gr.update(choices=[], value=[]), 
+        gr.update(choices=[], value=[]), gr.update(choices=[], value=None), 
+        gr.update(choices=[], value=None), gr.update(interactive=False),
+        [], [], None, None
+    )
+    if file is None: return error_return_values
+
     try:
         progress(0, desc="Reading file...")
         raw_df = pd.read_csv(file.name)
         progress(0.4, desc="Processing data...")
         processed_df = process_lumos_data(raw_df)
+        name_map = create_name_map(processed_df.columns)
+        
         progress(0.9, desc="Updating UI...")
         all_cols = ["None"] + list(processed_df.columns)
         numeric_cols = list(processed_df.select_dtypes(include=np.number).columns)
         
         return (
-            raw_df, processed_df, processed_df, "Data uploaded. Ready for EDA and Modeling.",
-            gr.update(choices=numeric_cols, interactive=True), gr.update(choices=numeric_cols, interactive=True),
-            gr.update(choices=all_cols, interactive=True), gr.update(choices=list(processed_df.columns), interactive=True)
+            raw_df, processed_df, name_map, "Data uploaded and processed.",
+            gr.update(choices=numeric_cols, value=numeric_cols, interactive=True), # Pre-select X
+            gr.update(choices=numeric_cols, value=numeric_cols, interactive=True), # Pre-select Y
+            gr.update(choices=all_cols, interactive=True),
+            gr.update(choices=list(processed_df.columns), value=None, interactive=True),
+            gr.update(interactive=True), # Enable model type selector
+            gr.update(choices=list(processed_df.columns), value=None, interactive=True),
+            gr.update(interactive=False),
+            [], [],
+            gr.update(value=raw_df), 
+            gr.update(value=processed_df)
         )
     except Exception as e:
-        return None, None, None, f"An error occurred: {e}", gr.update(choices=[]), gr.update(choices=[]), gr.update(choices=[]), gr.update(choices=[])
+        error_with_msg = list(error_return_values)
+        error_with_msg[3] = f"An error occurred: {e}"
+        return tuple(error_with_msg)
 
-def generate_manual_eda_plot(data, x_col, y_col, color_col, fit_5pl):
+def generate_manual_eda_plot(data, x_col, y_col, color_col):
+    """Generates a single, manually configured plot."""
     if data is None: return None, "Upload data to begin EDA."
     if not x_col or not y_col: return go.Figure(), "Please select both X and Y axes."
     
-    data_to_plot = data.copy()
-    color_arg = color_col if color_col != "None" else None
-
-    if color_arg and pd.api.types.is_numeric_dtype(data_to_plot[color_arg]) and data_to_plot[color_arg].nunique() > 10:
-        binned_col_name = f"{color_arg} (binned)"
-        data_to_plot[binned_col_name] = pd.qcut(data_to_plot[color_arg], q=5, duplicates='drop').astype(str)
-        color_arg = binned_col_name
-    
     title = f'Scatter Plot: {y_col} vs. {x_col}' + (f' (Colored by {color_col})' if color_col != "None" else '')
-    fig = px.scatter(data_to_plot, x=x_col, y=y_col, color=color_arg, title=title, template="plotly_dark")
-
-    if fit_5pl:
-        fit_info = fit_5pl_and_plot(fig, data_to_plot, x_col, y_col)
-        fig.add_annotation(x=0.05, y=0.95, xref="paper", yref="paper", text=fit_info, showarrow=False,
-                           font=dict(size=12, color="white"), align="left", bgcolor="rgba(0,0,0,0.5)")
+    fig = px.scatter(data, x=x_col, y=y_col, color=color_col if color_col != "None" else None, title=title, template="plotly_dark")
+    fit_5pl_and_plot(fig, data, x_col, y_col, color_col if color_col != "None" else None)
     return fig, f"Displaying: {title}"
 
-def generate_automated_eda(data, color_col, fit_5pl, progress=gr.Progress()):
-    if data is None: return [], "Upload data to generate plots."
+def generate_automated_eda(data, x_cols, y_cols, color_col, progress=gr.Progress()):
+    """Generates a gallery of plots for high-throughput EDA."""
+    if data is None: return [], "Upload data to generate plots.", []
+    if not x_cols or not y_cols: return [], "Please select variables for both X and Y axes.", []
+
+    plots = []
+    plot_combinations = list(product(x_cols, y_cols))
     
-    plot_dir = "plots_gallery"
-    if os.path.exists(plot_dir): shutil.rmtree(plot_dir)
-    os.makedirs(plot_dir, exist_ok=True)
+    for i, (x_col, y_col) in enumerate(plot_combinations):
+        if x_col == y_col: continue
+        progress(i / len(plot_combinations), desc=f"Plotting: {y_col} vs. {x_col}")
+        
+        title = f'{y_col} vs. {x_col}' + (f' (Colored by {color_col})' if color_col != "None" else '')
+        fig = px.scatter(data, x=x_col, y=y_col, color=color_col if color_col != "None" else None, title=title, template="plotly_dark")
+        fit_5pl_and_plot(fig, data, x_col, y_col, color_col if color_col != "None" else None)
+        plots.append(fig)
+
+    if not plots: return [], "No plots generated.", []
     
-    data_to_plot = data.copy()
-    numeric_cols = data_to_plot.select_dtypes(include=np.number).columns
-    categorical_cols = data_to_plot.select_dtypes(include=['object', 'category']).columns
-    color_arg = color_col if color_col != "None" else None
+    plot_files = save_plots_to_temp_dir(plots)
+    return plot_files, f"{len(plots)} plots generated.", plots
 
-    if color_arg and pd.api.types.is_numeric_dtype(data_to_plot[color_arg]) and data_to_plot[color_arg].nunique() > 10:
-        binned_col_name = f"{color_arg} (binned)"
-        data_to_plot[binned_col_name] = pd.qcut(data_to_plot[color_arg], q=5, duplicates='drop').astype(str)
-        color_arg = binned_col_name
+def run_automl(data, name_map, target_variable, model_type, progress=gr.Progress()):
+    """Runs the AutoML pipeline for either Regression or Classification."""
+    interactive_plots = []
+    try:
+        if data is None or target_variable is None:
+            raise ValueError("Data or target variable not provided.")
 
-    plot_files = []
-    total_plots = len(list(combinations(numeric_cols, 2))) + len(numeric_cols) * len(categorical_cols)
-    plots_done = 0
+        pc = reg if model_type == 'Regression' else clf
+        optimize_metric = 'R2' if model_type == 'Regression' else 'Accuracy'
+        
+        backend_df = data.rename(columns={v: k for k, v in name_map.items()})
+        backend_target = get_backend_name(target_variable)
 
-    if len(numeric_cols) >= 2:
-        for x_col, y_col in combinations(numeric_cols, 2):
-            progress(plots_done / total_plots if total_plots > 0 else 0, desc=f"Scatter: {y_col} vs. {x_col}")
-            title = f'{y_col} vs. {x_col}'
-            fig = px.scatter(data_to_plot, x=x_col, y=y_col, color=color_arg, title=title, template="plotly_dark")
-            if fit_5pl:
-                fit_info = fit_5pl_and_plot(fig, data_to_plot, x_col, y_col)
-                fig.add_annotation(x=0.05, y=0.95, xref="paper", yref="paper", text=fit_info, showarrow=False, font=dict(color="white"), bgcolor="rgba(0,0,0,0.5)")
-            
-            safe_x = sanitize_filename(x_col)
-            safe_y = sanitize_filename(y_col)
-            filepath = os.path.join(plot_dir, f'scatter_{safe_y}_vs_{safe_x}.png')
-            fig.write_image(filepath)
-            plot_files.append(filepath)
-            plots_done += 1
+        yield None, None, gr.update(visible=True), "Initializing AutoML...", [], interactive_plots
 
-    if len(numeric_cols) >= 1 and len(categorical_cols) >= 1:
-        for x_col, y_col in [(cat, num) for cat in categorical_cols for num in numeric_cols]:
-            progress(plots_done / total_plots if total_plots > 0 else 0, desc=f"Box Plot: {y_col} vs. {x_col}")
-            title = f'Distribution of {y_col} by {x_col}'
-            fig = px.box(data_to_plot, x=x_col, y=y_col, color=x_col, title=title, template="plotly_dark")
-            
-            safe_x = sanitize_filename(x_col)
-            safe_y = sanitize_filename(y_col)
-            filepath = os.path.join(plot_dir, f'box_{safe_y}_vs_{safe_x}.png')
-            fig.write_image(filepath)
-            plot_files.append(filepath)
-            plots_done += 1
-
-    if not plot_files: return [], "No suitable column pairs found for automated plotting."
-    progress(1, desc="Done.")
-    return plot_files, f"{len(plot_files)} plots generated for automated EDA."
-
-def run_automl(data, target_variable, numeric_features, categorical_features):
-    log_stream = io.StringIO()
-    with redirect_stdout(log_stream):
+        n_samples = len(backend_df.dropna(subset=[backend_target]))
+        fold_strategy = 'loocv' if n_samples < 50 else 10
+        
+        yield None, None, gr.update(visible=True), f"Setting up PyCaret ({fold_strategy} folds)...", [], interactive_plots
+        
+        s = pc.setup(data=backend_df, target=backend_target, 
+                     html=False, verbose=False, session_id=123,
+                     polynomial_features=False, transformation=True, normalize=True,
+                     feature_selection=True, fold_strategy=fold_strategy)
+        
+        yield None, None, gr.update(visible=True), "Comparing models...", [], interactive_plots
+        best_model = pc.compare_models(sort=optimize_metric)
+        leaderboard = pc.pull()
+        
+        tuned_model = None
         try:
-            if data is None or target_variable is None:
-                yield None, "Error: Data or target not provided.", None, None, None, ""
-                return
-
-            yield None, "Processing: Cleaning data...", None, None, None, log_stream.getvalue()
-            cleaned_data = data.dropna(subset=[target_variable])
-            n_samples = len(cleaned_data)
-            fold = min(10, n_samples - 1) if n_samples > 20 else 3
-            
-            yield None, f"Processing: Setting up PyCaret with {fold} folds...", None, None, None, log_stream.getvalue()
-            s = setup(data=cleaned_data, target=target_variable, numeric_features=numeric_features,
-                      categorical_features=categorical_features, html=False, verbose=False,
-                      polynomial_features=True, session_id=123, fold=fold)
-            
-            yield None, "Processing: Comparing models...", None, None, None, log_stream.getvalue()
-            best_model = compare_models()
-            
-            yield None, "Processing: Finalizing and generating plots...", None, None, None, log_stream.getvalue()
-            results = pull()
-            
-            plot_files = []
-            plots_to_generate = ['residuals', 'feature', 'prediction_error', 'cooks', 'learning']
-            for plot_name in plots_to_generate:
-                try:
-                    plot_model(best_model, plot=plot_name, save=True)
-                    plot_files.append(f"{plot_name.replace('_', ' ').title()}.png")
-                except Exception as e:
-                    print(f"\nCould not generate plot: {plot_name}. Error: {e}")
-            final_log = log_stream.getvalue()
-            yield results, "AutoML complete.", plot_files, s, best_model, final_log
-
+            yield leaderboard, None, gr.update(visible=True), f"Tuning best model ({optimize_metric})...", [], interactive_plots
+            tuned_model = pc.tune_model(best_model, optimize=optimize_metric, verbose=False)
         except Exception as e:
-            yield None, f"An error occurred: {e}", None, None, None, log_stream.getvalue() + f"\nERROR: {e}"
+            print(f"Model tuning failed, proceeding with original best model. Error: {e}")
+            tuned_model = None
 
-def update_feature_lists(data, target_variable):
-    if data is not None and isinstance(data, pd.DataFrame) and target_variable in data.columns:
-        numeric_features = [c for c in data.select_dtypes(include=np.number).columns if c != target_variable]
-        categorical_features = [c for c in data.select_dtypes(include=['object', 'category']).columns if c != target_variable]
-        return gr.update(choices=numeric_features, value=numeric_features), gr.update(choices=categorical_features, value=categorical_features)
-    return gr.update(choices=[], value=[]), gr.update(choices=[], value=[])
+        final_model_obj = best_model
+        if tuned_model is not None:
+            tuned_results = pc.pull()
+            if not tuned_results.empty and tuned_results[optimize_metric][0] > leaderboard[optimize_metric][0]:
+                final_model_obj = tuned_model
+                print(f"Using tuned model as it performed better on {optimize_metric}.")
+            else:
+                print(f"Using original best model as tuning did not improve {optimize_metric}.")
+        else:
+            print("Using original best model because tuning failed.")
+
+        yield leaderboard, None, gr.update(visible=True), "Finalizing model...", [], interactive_plots
+        final_model = pc.finalize_model(final_model_obj)
+        final_results = pc.pull()
+        kpi_html = create_kpi_dashboard(final_results, name_map, model_type)
+
+        plot_names = ['residuals', 'feature_all', 'prediction_error'] if model_type == 'Regression' else ['auc', 'confusion_matrix', 'feature_all']
+        for plot_name in plot_names:
+            try:
+                fig = pc.plot_model(final_model, plot=plot_name, save=False, display_format='plotly', use_train_data=True)
+                if fig:
+                    fig.update_layout(template='plotly_dark', title_text=f"{plot_name.replace('_', ' ').title()} Plot")
+                    interactive_plots.append(fig)
+            except Exception as e:
+                print(f"Could not generate plot: {plot_name}. Error: {e}")
+        
+        plot_files = save_plots_to_temp_dir(interactive_plots)
+        yield final_results, kpi_html, gr.update(visible=False), "AutoML complete.", plot_files, interactive_plots
+
+    except Exception as e:
+        yield None, None, gr.update(visible=False), f"An error occurred: {e}", [], []
+
+def create_kpi_dashboard(results_df, name_map, model_type):
+    """Creates an HTML dashboard for key performance indicators."""
+    if results_df.empty: return ""
+    model_name = results_df.index[0]
+    
+    if model_type == 'Regression':
+        metric1_name, metric1_val = 'R²', f"{results_df.loc[model_name, 'R2']:.4f}"
+        metric2_name, metric2_val = 'MAE', f"{results_df.loc[model_name, 'MAE']:.2f}"
+        metric3_name, metric3_val = 'RMSE', f"{results_df.loc[model_name, 'RMSE']:.2f}"
+    else: # Classification
+        metric1_name, metric1_val = 'Accuracy', f"{results_df.loc[model_name, 'Accuracy']:.4f}"
+        metric2_name, metric2_val = 'AUC', f"{results_df.loc[model_name, 'AUC']:.4f}"
+        metric3_name, metric3_val = 'F1', f"{results_df.loc[model_name, 'F1']:.4f}"
+
+    kpi_style = "padding: 10px; margin: 5px; border-radius: 8px; background-color: #2F2F2F; text-align: center; color: white; flex-grow: 1;"
+    return f"""
+    <div style="display: flex; justify-content: space-around; width: 100%; gap: 10px;">
+        <div style="{kpi_style}"><h3 style="margin:0; padding:0; color:#FF7C00;">Best Model</h3><p style="margin:0;">{model_name}</p></div>
+        <div style="{kpi_style}"><h3 style="margin:0; padding:0; color:#FF7C00;">{metric1_name}</h3><p style="margin:0;">{metric1_val}</p></div>
+        <div style="{kpi_style}"><h3 style="margin:0; padding:0; color:#FF7C00;">{metric2_name}</h3><p style="margin:0;">{metric2_val}</p></div>
+        <div style="{kpi_style}"><h3 style="margin:0; padding:0; color:#FF7C00;">{metric3_name}</h3><p style="margin:0;">{metric3_val}</p></div>
+    </div>"""
 
 # --- Main App UI ---
 css = """
-#main_title h1 { color: #FF7C00; text-align: center; display: block; }
+#main_container { background-color: #121212; }
+#control_sidebar { background-color: #1E1E1E; padding: 15px; border-radius: 10px; }
 .gradio-container { max-width: 100% !important; }
+.section_accordion .label-wrap { background-color: #2F2F2F !important; color: white !important; }
 """
 
-with gr.Blocks(theme=gr.themes.Default(primary_hue=gr.themes.colors.orange), css=css) as app:
-    shared_data = gr.State()
-    pycaret_setup_state = gr.State()
-    best_model_state = gr.State()
+with gr.Blocks(theme=gr.themes.Default(primary_hue=gr.themes.colors.orange), css=css, elem_id="main_container") as app:
+    raw_data, processed_data, name_map = gr.State(), gr.State(), gr.State({})
+    automl_interactive_plots, eda_interactive_plots = gr.State([]), gr.State([])
 
     gr.Markdown("# Eli Health: LFA Data Analysis Platform", elem_id="main_title")
 
-    with gr.Tabs() as tabs:
-        with gr.TabItem("1. Data Upload", id=0):
-            with gr.Row():
-                with gr.Column(scale=1, min_width=300):
-                    file_input = gr.File(label="Upload CSV File")
-                    upload_button = gr.Button("Upload and Process", variant="primary")
-                    upload_status = gr.Textbox(label="Status", interactive=False, lines=2)
-                with gr.Column(scale=3):
-                    gr.Markdown("### Data Preview")
-                    with gr.Tabs():
-                        with gr.TabItem("Processed Data"):
-                            data_output_preview = gr.DataFrame(label="Processed & Transformed Data Preview", wrap=True)
-                        with gr.TabItem("Raw Data"):
-                            raw_data_preview = gr.DataFrame(label="Raw Uploaded Data Preview", wrap=True)
-
-        with gr.TabItem("2. Exploratory Data Analysis (EDA)", id=1):
-            with gr.Tabs():
-                with gr.TabItem("Automated High-Throughput EDA"):
-                    ht_eda_status = gr.Textbox(label="Status", interactive=False)
-                    with gr.Row():
-                        ht_eda_color_col = gr.Dropdown(label="Color By", choices=[], interactive=True)
-                        ht_fit_5pl = gr.Checkbox(label="Fit 5PL Curve (Scatter Plots)", value=False)
-                    ht_eda_button = gr.Button("Generate Automated Plots", variant="primary")
-                    ht_eda_gallery = gr.Gallery(label="Automated EDA Plots", columns=3, object_fit="contain", height="auto")
-                
-                with gr.TabItem("Manual Plotting"):
-                    with gr.Row():
-                        with gr.Column(scale=1, min_width=300):
-                            gr.Markdown("### Manual Scatter Plot")
-                            eda_x_axis = gr.Dropdown(label="Select X-Axis", choices=[], interactive=True)
-                            eda_y_axis = gr.Dropdown(label="Select Y-Axis", choices=[], interactive=True)
-                            eda_color_col = gr.Dropdown(label="Color By", choices=[], interactive=True)
-                            eda_fit_5pl = gr.Checkbox(label="Fit 5PL Curve", value=False)
-                            eda_plot_button = gr.Button("Generate Plot", variant="secondary")
-                        with gr.Column(scale=2):
-                            eda_plot_output = gr.Plot(label="EDA Plot")
-
-        with gr.TabItem("3. AutoML Modeling", id=2):
-            with gr.Row():
-                with gr.Column(scale=1, min_width=300):
-                    target_variable_dropdown = gr.Dropdown(label="Select Target Variable", choices=[], interactive=False)
-                    numeric_features_checkbox = gr.CheckboxGroup(label="Numeric Features", interactive=True)
-                    categorical_features_checkbox = gr.CheckboxGroup(label="Categorical Features", interactive=True)
-                    automl_button = gr.Button("Run AutoML", variant="primary", interactive=False)
-                    status_box_automl = gr.Textbox(label="Status", interactive=False, lines=2)
-                with gr.Column(scale=2):
-                    model_leaderboard = gr.DataFrame(label="Model Leaderboard")
-                    automl_log_output = gr.Textbox(label="Live AutoML Log", lines=20, interactive=False, max_lines=20)
-
-        with gr.TabItem("4. Model Analysis", id=3):
-            gr.Markdown("### View Generated Model Plots")
-            model_plot_gallery = gr.Gallery(label="Model Diagnostic Plots", columns=2, object_fit="contain", height="auto")
+    with gr.Row():
+        with gr.Column(scale=1, min_width=350, elem_id="control_sidebar"):
+            gr.Markdown("## Controls")
             
+            with gr.Accordion("1. Data Upload", open=True, elem_classes="section_accordion"):
+                file_input = gr.File(label="Upload CSV File")
+                upload_button = gr.Button("Upload and Process", variant="primary")
+                upload_status = gr.Textbox(label="Status", interactive=False, lines=2)
+            
+            with gr.Accordion("2. EDA Setup", open=False, elem_classes="section_accordion"):
+                with gr.Tabs():
+                    with gr.TabItem("High-Throughput", id=0):
+                        ht_x_cols = gr.CheckboxGroup(label="Select X-Axis Variables", choices=[], value=[])
+                        ht_y_cols = gr.CheckboxGroup(label="Select Y-Axis Variables", choices=[], value=[])
+                        ht_eda_color_col = gr.Dropdown(label="Color By (Categorical)", choices=[])
+                        ht_eda_button = gr.Button("Generate Automated Plots", variant="primary")
+                    with gr.TabItem("Manual Plot", id=1):
+                        manual_x_axis = gr.Dropdown(label="Select X-Axis", choices=[])
+                        manual_y_axis = gr.Dropdown(label="Select Y-Axis", choices=[])
+                        manual_color_col = gr.Dropdown(label="Color By", choices=[])
+                        manual_plot_button = gr.Button("Generate Manual Plot", variant="secondary")
+
+            with gr.Accordion("3. AutoML Setup", open=False, elem_classes="section_accordion"):
+                model_type_selector = gr.Radio(choices=['Regression', 'Classification'], label="Select Analysis Type", value='Regression', interactive=False)
+                target_variable_dropdown = gr.Dropdown(label="Select Target Variable", choices=[], interactive=False)
+                automl_button = gr.Button("Run AutoML", variant="primary", interactive=False)
+
+        with gr.Column(scale=3):
+            with gr.Accordion("Data Preview", open=True, elem_classes="section_accordion"):
+                with gr.Tabs():
+                    with gr.TabItem("Processed Data"): data_output_preview = gr.DataFrame(wrap=True)
+                    with gr.TabItem("Raw Data"): raw_data_preview = gr.DataFrame(wrap=True)
+
+            with gr.Accordion("Exploratory Analysis", open=True, elem_classes="section_accordion"):
+                interactive_eda_plot = gr.Plot(label="Interactive EDA Plot", visible=False)
+                ht_eda_status = gr.Textbox(label="Status", interactive=False, visible=True)
+                gr.Markdown("Click any plot below to view it interactively above.")
+                ht_eda_gallery = gr.Gallery(label="Automated EDA Plots", columns=3, object_fit="contain", height="auto", type="filepath")
+            
+            with gr.Accordion("AutoML Modeling", open=True, elem_classes="section_accordion"):
+                interactive_model_plot = gr.Plot(label="Interactive Model Plot", visible=False)
+                status_box_automl = gr.Textbox(label="Live Status", interactive=False)
+                status_spinner = gr.HTML('<div class="generating"></div>', visible=False)
+                kpi_dashboard_html = gr.HTML()
+                with gr.Tabs():
+                    with gr.TabItem("Model Leaderboard"): model_leaderboard = gr.DataFrame()
+                    with gr.TabItem("Model Diagnostic Plots"):
+                        gr.Markdown("Click any plot below to view it interactively above.")
+                        model_plot_gallery = gr.Gallery(label="Generated Model Plots", columns=3, object_fit="contain", height="auto")
+
     # --- Event Handlers ---
+    upload_outputs = [
+        raw_data, processed_data, name_map, upload_status, ht_x_cols, ht_y_cols, ht_eda_color_col,
+        target_variable_dropdown, model_type_selector, manual_x_axis, manual_y_axis, manual_color_col,
+        automl_button, ht_eda_gallery, model_plot_gallery, raw_data_preview, data_output_preview
+    ]
     
-    upload_button.click(
-        fn=upload_and_process_data,
-        inputs=file_input,
-        outputs=[raw_data_preview, data_output_preview, shared_data, upload_status, eda_x_axis, eda_y_axis, eda_color_col, target_variable_dropdown]
-    ).then(
-        lambda data: gr.update(choices=["None"] + list(data.columns) if data is not None else []),
-        inputs=shared_data,
-        outputs=ht_eda_color_col
-    )
-    
-    eda_plot_button.click(fn=generate_manual_eda_plot, inputs=[shared_data, eda_x_axis, eda_y_axis, eda_color_col, eda_fit_5pl], outputs=[eda_plot_output, upload_status])
-    ht_eda_button.click(fn=generate_automated_eda, inputs=[shared_data, ht_eda_color_col, ht_fit_5pl], outputs=[ht_eda_gallery, ht_eda_status])
+    @upload_button.click(inputs=[file_input], outputs=upload_outputs)
+    def full_upload_process(file, progress=gr.Progress()):
+        error_return_values = (None, None, {}, "Please upload a CSV file.", *([gr.update(choices=[], value=[])] * 3), *([gr.update(choices=[], value=None, interactive=False)]*5), *([gr.update(value=None)]*4))
+        if file is None: return error_return_values
+        try:
+            progress(0, desc="Reading file...")
+            raw_df = pd.read_csv(file.name)
+            progress(0.4, desc="Processing data...")
+            processed_df = process_lumos_data(raw_df)
+            name_map = create_name_map(processed_df.columns)
+            
+            progress(0.9, desc="Updating UI...")
+            all_cols = ["None"] + list(processed_df.columns)
+            numeric_cols = list(processed_df.select_dtypes(include=np.number).columns)
+            
+            return (raw_df, processed_df, name_map, "Data uploaded and processed.",
+                    gr.update(choices=numeric_cols, value=numeric_cols, interactive=True), # ht_x_cols
+                    gr.update(choices=numeric_cols, value=numeric_cols, interactive=True), # ht_y_cols
+                    gr.update(choices=all_cols, interactive=True), # ht_eda_color_col
+                    gr.update(choices=list(processed_df.columns), interactive=True), # target_variable_dropdown
+                    gr.update(interactive=True), # model_type_selector
+                    gr.update(choices=numeric_cols, interactive=True), # manual_x_axis
+                    gr.update(choices=numeric_cols, interactive=True), # manual_y_axis
+                    gr.update(choices=all_cols, interactive=True), # manual_color_col
+                    gr.update(interactive=False), # automl_button
+                    gr.update(value=[]), gr.update(value=[]), # galleries
+                    gr.update(value=raw_df), gr.update(value=processed_df))
+        except Exception as e:
+            return (None, None, {}, f"An error occurred: {e}", *([gr.update(choices=[], value=[])] * 3), *([gr.update(choices=[], value=None, interactive=False)]*5), *([gr.update(value=None)]*4))
 
-    target_variable_dropdown.change(
-        fn=update_feature_lists,
-        inputs=[shared_data, target_variable_dropdown],
-        outputs=[numeric_features_checkbox, categorical_features_checkbox]
-    ).then(lambda: gr.update(interactive=True), None, automl_button)
+    manual_plot_button.click(fn=generate_manual_eda_plot, inputs=[processed_data, manual_x_axis, manual_y_axis, manual_color_col], outputs=[interactive_eda_plot, ht_eda_status]).then(lambda: gr.update(visible=True), None, interactive_eda_plot)
+    ht_eda_button.click(fn=generate_automated_eda, inputs=[processed_data, ht_x_cols, ht_y_cols, ht_eda_color_col], outputs=[ht_eda_gallery, ht_eda_status, eda_interactive_plots])
+    target_variable_dropdown.change(lambda target: gr.update(interactive=target is not None), target_variable_dropdown, automl_button)
+    automl_button.click(fn=run_automl, inputs=[processed_data, name_map, target_variable_dropdown, model_type_selector], outputs=[model_leaderboard, kpi_dashboard_html, status_spinner, status_box_automl, model_plot_gallery, automl_interactive_plots])
 
-    automl_button.click(
-        fn=run_automl,
-        inputs=[shared_data, target_variable_dropdown, numeric_features_checkbox, categorical_features_checkbox],
-        outputs=[model_leaderboard, status_box_automl, model_plot_gallery, pycaret_setup_state, best_model_state, automl_log_output]
-    )
+    def show_interactive_plot(evt: gr.SelectData, plots_list: list):
+        if plots_list and evt.index < len(plots_list):
+            return gr.update(value=plots_list[evt.index], visible=True)
+        return gr.update(visible=False)
+
+    ht_eda_gallery.select(fn=show_interactive_plot, inputs=[eda_interactive_plots], outputs=[interactive_eda_plot])
+    model_plot_gallery.select(fn=show_interactive_plot, inputs=[automl_interactive_plots], outputs=[interactive_model_plot])
 
 if __name__ == "__main__":
-    app.launch(debug=True)
+    setup_temp_dir()
+    app.launch(debug=True, show_error=True)
 
