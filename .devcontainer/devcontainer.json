@@ -1,0 +1,23 @@
+{
+    "name": "Python 3.11 NiceGUI Development",
+    "image": "mcr.microsoft.com/devcontainers/python:3.11-bookworm",
+    
+    "postCreateCommand": "pip install --no-cache-dir -r requirements.txt",
+    
+    "portsAttributes": {
+        "8050": {
+            "label": "Gradeio App",
+            "onAutoForward": "notify"
+        }
+    },
+    
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-azuretools.vscode-docker" 
+            ]
+        }
+    }
+}
