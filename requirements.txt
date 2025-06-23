@@ -4,3 +4,4 @@ pycaret[full]
 ydata-profiling
 plotly
 python-multipart
+statannot
